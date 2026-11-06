@@ -1,0 +1,1380 @@
+/* eslint-disable */
+// Umber Flute — Originkit
+
+"use client"
+
+import { addPropertyControls, ControlType } from "framer"
+import { useEffect, useRef, useState } from "react"
+import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent } from "react"
+
+/*
+ * UmberFlute — a frosted, reeded-glass capsule button. Behind the reeds a
+ * dark body with an ember-lit rim turns on a slow loop, and an indigo light
+ * washes in from the left and fades again.
+ *
+ * Built after a 12 s screen recording (960 × 720, 30 fps) of a "Searching…"
+ * pill: six vertical reeds of frosted glass over a soft grey scene, two dark
+ * bodies whose edges catch a thin amber light, smeared sideways by the reeds
+ * and stepped from one reed to the next. The scene repeats every 3.1 s
+ * (93 frames).
+ *
+ * Measured off the frames (capsule 664 × 200, centred):
+ *   six reeds 110.7 px wide · each reed shows a strip of the scene 0.275 of
+ *   its own width, stretched across it, and each sits 22.1 px lower in the
+ *   scene than the reed to its left (fitted with the scene) · reed joints
+ *   ~+12/255 lighter over a few px · shade ≈ rgb(9,8,12), ember up to
+ *   rgb(141,89,33), a soft glow round a brighter core · indigo ≈
+ *   rgb(55,58,74) at its height · bottom frost lifts to ~157 at 13 px above
+ *   the rim, 1.0·exp(−(d − 4) / 10 px), fitted to the time-mean profile ·
+ *   rim a 1.5 px light line ≈ 235 · faint drop shadow · type white 252,
+ *   centred, 331 px wide, set in Inter 500 (the closest Google face; the
+ *   clip looks like SF Pro).
+ * The scene motion was fitted per reed, band and loop phase (rms 19/255) as
+ * first harmonics of the loop: an edge y = a0 + a1·x + a2·x² below which the
+ * lower body lies, and a disc (centre, radius) for the upper-left body.
+ *
+ * Interaction, added on top of the recording (it shows none):
+ * - Hover: under the pointer the reeds melt into a drop of clear glass, a
+ *   lens through which the scene behind is seen whole, unfrosted and
+ *   magnified, where the reeds around it smear it into strips. Toward its
+ *   rim the view squeezes and splits into a thin colour fringe, a dark band
+ *   runs just inside the edge and a light line rides the rim, as on a real
+ *   drop of glass. It swells in with a little overshoot, stretches along
+ *   the way the pointer moves, and shrinks away when the pointer leaves.
+ * - Press: the drop bulges (magnifying harder for a moment), the capsule
+ *   gives a little and the reeds wobble, a wave running out from the press
+ *   point across them.
+ *
+ * How it is built:
+ * - One WebGL2 canvas covering the capsule and its shadow room draws the
+ *   scene, reeds, frost, rim and shadow in a single pass. The scene is a
+ *   handful of analytic shapes, so there is nothing to bake or upload but a
+ *   few uniforms per frame.
+ * - The click target and label are a real <a>/<button> laid over the shape
+ *   with the same transform, so keyboard, screen readers and hit-testing are
+ *   the browser's own and the type stays crisp.
+ * - Frames are vsync-locked at 60 fps while the scene moves, pause off screen
+ *   or in a hidden tab, and stop entirely when Speed is 0 (or with reduced
+ *   motion) once everything has settled.
+ */
+
+// ---------------------------------------------------------------- constants
+
+const REF_W = 960
+const REF_H = 720
+const REF_ASPECT = REF_W / REF_H
+const MAX_DPR = 2
+const PIXEL_CAP = 2.6e6
+const PERSPECTIVE = 1000 // ref px: the lens Tilt leans the button under
+const MARGIN_X = 0.25 // shadow / squish room round the capsule, shares of its height
+const MARGIN_T = 0.2
+const MARGIN_B = 0.45
+const UNIT_H = 200 // scene units are px on a capsule this tall
+
+const LOOP_S = 3.1 // the recording's loop at Speed 5: 93 frames at 30 fps
+
+// Scene motion: [mean, cos, sin] of the loop phase, in scene units (x right,
+// y down, from the capsule centre). Fitted, see header.
+const EDGE_A0 = [-58.76, 33.63, -3.4]
+const EDGE_A1 = [0.1736, -0.339, 0.0943]
+const EDGE_A2 = [1.66, 1.769, -0.579] // ×1e-3
+const DISC_X = [-163.8, 4.18, 4.16]
+const DISC_Y = [-18.4, 34.2, -14.96]
+const DISC_R = [156.2, -2.74, -7.41]
+const POOL_K = [1.089, -0.089, 0.344] // a pale pool of light low on the left
+const POOL_AT = [-139.7, 133.2]
+const POOL_TINT = 2.0 // its colour, as a multiple of the ground's
+// The indigo is a tint, not added light: it barely moves the brightness (a
+// band-mean fit drops it), but turns the left third from neutral to
+// rgb(57,60,74) half a loop in.
+const GLOW_K = [0.175, -0.175, 0]
+const GLOW_AT = [-250, 20] // centre of the indigo light
+const LIGHT_SIZE = [230, 200] // both lights' reach
+
+// Reeds.
+const REEDS = 6
+const REED_M = 0.275 // scene strip each reed shows, of its own width
+const REED_DY = 22.1 // scene units each reed sits below the one to its left
+const REED_JOINT = 0.05 // light on the joints
+const REED_LENS = 0.04 // light toward each reed's sides
+
+// Scene tone.
+const GROUND_GX = 0.088 // ground light across, per 300 units
+const GROUND_GY = -0.853 // and down, per 100 units: lit from above
+const SOFT = 6.07 // body edge softness, units
+// The bodies absorb the light falling on them: the fit puts their tone 0.072
+// below black, so the pool and ember add little over them. Shade sits that
+// far above the floor the shader starts from.
+const SHADE_SINK = 0.107
+const EMBER_GLOW = 0.106 // the ember's soft glow along the edge
+const EMBER_WIDE = 11.1 // its half-width, units
+const EMBER_LINE = 0.2 // and the thin bright line at its heart
+const EMBER_THIN = 4.2
+
+// Glass, on a 200 px capsule, kept as shares of its height.
+const FROST_K = 1.0 // bottom frost
+const FROST_OFF = 4 / 200
+const FROST_D = 10 / 200
+const TOP_K = 0.22 // thin haze under the top rim
+const TOP_D = 4 / 200
+const HAZE_K = 0.12 // haze round the whole outline
+const HAZE_D = 14 / 200
+const SHADOW_A = 0.22
+const SHADOW_DY = 0.06
+const SHADOW_D = 0.11
+
+// Label: Inter 500, the closest Google face to the recording's lettering
+// (by eye; every candidate scored IoU ≈ 0.65, the clip is likely SF Pro).
+const LABEL_SIZE = 0.302 // font size, of the button height, when the Font sets none
+
+// Interaction.
+const LENS_R = 62 // the drop's radius at Lens 5, scene units
+const LENS_MAG = 1.5 // magnification at its centre at Bend 5
+const LENS_RIM = 1.35 // view scale at its rim (> 1 squeezes more of the scene in)
+const PRISM = 0.12 // colour split at the rim at Prism 5, share of the view
+const STRETCH = 0.4 // most the drop stretches along its motion
+const STRETCH_V = 700 // pointer speed (scene units/s) for most of that stretch
+const PULSE = 0.35 // extra magnification a press gives, at its height
+const WOBBLE = 22 // scene units of reed wobble at Ripple 5
+const WOBBLE_DECAY = 3.2 // 1/s
+const SQUISH = 0.975
+
+// ---------------------------------------------------------------- types
+
+interface FontValue {
+    fontFamily?: string
+    fontWeight?: number | string
+    fontStyle?: string
+    fontSize?: string | number
+    letterSpacing?: string | number
+}
+
+export interface Scene {
+    /** The pale ground behind the glass. */
+    ground: string
+    /** The dark bodies. */
+    shade: string
+    /** The thin light on the bodies' edges. */
+    ember: string
+    /** The light that washes in from the left. */
+    glow: string
+}
+
+export interface Placement {
+    x: number
+    y: number
+    angle: number
+    tilt: number
+}
+
+export interface Response {
+    /** 0–10: how big the drop of clear glass under the pointer is. */
+    lens: number
+    /** 0–10: how strongly the drop refracts (magnifies) what is behind it. */
+    bend: number
+    /** 0–10: the colour fringe the drop splits at its rim. */
+    prism: number
+    /** 0–10: how hard a press makes the reeds wobble. */
+    ripple: number
+}
+
+export interface Advanced {
+    refraction: number
+    step: number
+    frost: number
+    joints: number
+    rim: number
+    shadow: number
+}
+
+export interface UmberFluteProps {
+    label?: string
+    /** An external page opens in a new tab; anything else navigates here. */
+    link?: string
+    onClick?: () => void
+    background?: string
+    font?: FontValue
+    textColor?: string
+    /** How many reeds of glass run across the button. */
+    reeds?: number
+    buttonWidth?: number
+    buttonHeight?: number
+    radius?: number
+    scene?: Partial<Scene>
+    placement?: Partial<Placement>
+    response?: Partial<Response>
+    /** 0–10: how fast the scene turns. 5 = the recording's 3.1 s loop, 0 holds it still. */
+    speed?: number
+    advanced?: Partial<Advanced>
+    style?: CSSProperties
+}
+
+const DEFAULTS = {
+    label: "HOVER ME",
+    link: "",
+    background: "#000000",
+    textColor: "#FFFFFF",
+    reeds: 7,
+    buttonWidth: 500,
+    buttonHeight: 160,
+    radius: 100,
+    speed: 3.8,
+}
+
+const WEB_FONT = "Inter"
+const WEB_FONT_CSS = "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+const DEFAULT_FONT: FontValue = { fontFamily: WEB_FONT, fontWeight: 500, letterSpacing: "-0.01em" }
+const FALLBACK_STACK = '"Inter", "SF Pro Text", system-ui, sans-serif'
+
+const DEFAULT_SCENE: Scene = { ground: "#3D3D3D", shade: "#09080C", ember: "#D2802E", glow: "#283058" }
+const DEFAULT_PLACEMENT: Placement = { x: 0, y: 0, angle: 0, tilt: 0 }
+const DEFAULT_RESPONSE: Response = { lens: 5, bend: 5, prism: 5, ripple: 5 }
+const DEFAULT_ADVANCED: Advanced = { refraction: 100, step: 100, frost: 100, joints: 100, rim: 100, shadow: 100 }
+
+// ---------------------------------------------------------------- helpers
+
+function clamp(x: number, a: number, b: number) {
+    return x < a ? a : x > b ? b : x
+}
+
+type RGB = [number, number, number]
+
+// Framer colours can arrive as var(--token); WebGL cannot read those.
+function resolveRGB(el: HTMLElement, c: string, fb: RGB): RGB {
+    const prev = el.style.color
+    el.style.color = ""
+    el.style.color = c
+    const out = getComputedStyle(el).color
+    el.style.color = prev
+    const m = out.match(/[\d.]+/g)
+    if (!m || m.length < 3) return fb
+    return [+m[0], +m[1], +m[2]]
+}
+
+function sdRoundRect(x: number, y: number, hw: number, hh: number, r: number) {
+    const qx = Math.abs(x) - hw + r
+    const qy = Math.abs(y) - hh + r
+    return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - r
+}
+
+function harm(k: number[], co: number, si: number) {
+    return k[0] + k[1] * co + k[2] * si
+}
+
+// The Font control's size, in design px (px, rem/em as 16 px, or a bare number).
+function fontPx(v: string | number | undefined): number | null {
+    if (typeof v === "number") return v > 0 ? v : null
+    if (typeof v !== "string") return null
+    const m = v.trim().match(/^([\d.]+)\s*(px|rem|em)?$/i)
+    if (!m) return null
+    const n = parseFloat(m[1]) * (m[2] && m[2].toLowerCase() !== "px" ? 16 : 1)
+    return n > 0 ? n : null
+}
+
+// ---------------------------------------------------------------- shaders
+
+const VS = `#version 300 es
+void main() {
+    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`
+
+const f = (x: number) => x.toFixed(4)
+
+const FS = `#version 300 es
+precision highp float;
+uniform vec2 uRes;          // buffer px
+uniform vec4 uBox;          // capsule centre (buffer px, y down), half size
+uniform float uRad;         // corner radius, buffer px
+uniform float uPx;          // buffer px per CSS px
+uniform vec4 uEdge;         // lower body edge a0, a1, a2 (scene units), -
+uniform vec2 uLight;        // pool, glow strength
+uniform vec4 uDisc;         // upper body centre, radius; reed count
+uniform vec2 uReed;         // strip share, step
+uniform vec4 uLook;         // frost, joints, rim, shadow
+uniform vec4 uHand;         // pointer on the glass (units from centre), step of the reed under it, -
+uniform vec4 uLens;         // drop radius (units), centre magnification, rim view scale, prism
+uniform vec3 uVel;          // drop stretch direction (unit), stretch
+uniform vec4 uWob;          // press x (scene units), amplitude, time since press, -
+uniform vec3 uGround;
+uniform vec3 uShade;
+uniform vec3 uEmber;
+uniform vec3 uGlow;
+out vec4 outColor;
+
+float sdRound(vec2 p, vec2 b, float r) {
+    vec2 q = abs(p) - b + r;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+
+// The scene behind the glass, in scene units from the capsule centre.
+vec3 scene(vec2 q) {
+    float dA = q.y - (uEdge.x + uEdge.y * q.x + uEdge.z * 0.001 * q.x * q.x);
+    float dB = uDisc.z - length(q - uDisc.xy);
+    float d = max(dA, dB);
+    float cover = 1.0 / (1.0 + exp(-d / ${f(SOFT)}));
+    vec3 ground = uGround * max(0.0, 1.0 + ${f(GROUND_GX)} * q.x / 300.0 + ${f(GROUND_GY)} * q.y / 100.0);
+    vec3 col = mix(ground, uShade - ${f(SHADE_SINK)}, cover);
+    // the edge catches the ember: a soft glow round a thin bright line
+    float e = d / ${f(EMBER_WIDE)};
+    float t = d / ${f(EMBER_THIN)};
+    col += uEmber * (${f(EMBER_GLOW)} * exp(-e * e) + ${f(EMBER_LINE)} * exp(-t * t));
+    vec2 lp = (q - vec2(${f(POOL_AT[0])}, ${f(POOL_AT[1])})) / vec2(${f(LIGHT_SIZE[0])}, ${f(LIGHT_SIZE[1])});
+    vec2 lg = (q - vec2(${f(GLOW_AT[0])}, ${f(GLOW_AT[1])})) / vec2(${f(LIGHT_SIZE[0])}, ${f(LIGHT_SIZE[1])});
+    float lit = 0.55 + 0.45 * cover;
+    col += uGround * ${f(POOL_TINT)} * uLight.x * exp(-dot(lp, lp)) * lit;
+    col = max(col, 0.0);
+    // indigo tint at the glow colour's hue, brightness kept
+    vec3 tint = uGlow / max(dot(uGlow, vec3(0.3, 0.59, 0.11)), 0.02);
+    return col * mix(vec3(1.0), tint, uLight.y * exp(-dot(lg, lg)));
+}
+
+// Reed i's view of the scene at x (scene units across the reed from its centre).
+vec3 reed(float i, float x, float y, float n, float rw) {
+    float c = (i + 0.5) * rw - 0.5 * n * rw;
+    float wob = uWob.y * sin(18.0 * uWob.z - abs(c - uWob.x) / 45.0) * step(abs(c - uWob.x) / 45.0, 18.0 * uWob.z);
+    vec2 q = vec2(c + x * uReed.x + wob, y + (i - 0.5 * (n - 1.0)) * uReed.y);
+    return scene(q);
+}
+
+void main() {
+    vec2 frag = vec2(gl_FragCoord.x, uRes.y - gl_FragCoord.y);
+    vec2 p = frag - uBox.xy;
+    float H = uBox.w * 2.0;
+    float W = uBox.z * 2.0;
+    float sd = sdRound(p, uBox.zw, uRad);
+    float cover = clamp(0.5 - sd, 0.0, 1.0);
+
+    // Drop shadow, under the glass only (premultiplied black).
+    float ss = sdRound(p - vec2(0.0, ${f(SHADOW_DY)} * H), uBox.zw, uRad);
+    float shadow = uLook.w * ${f(SHADOW_A)} * exp(-max(ss, 0.0) / (${f(SHADOW_D)} * H));
+    vec2 ed = min(frag, uRes - frag);
+    shadow *= smoothstep(0.0, 0.12 * H, min(ed.x, ed.y));
+    if (cover <= 0.0) {
+        outColor = vec4(0.0, 0.0, 0.0, shadow);
+        return;
+    }
+
+    // Scene units per buffer px.
+    float su = ${f(UNIT_H)} / H;
+    float n = uDisc.w;
+    float rw = W * su / n; // reed width, scene units
+    float xs = (p.x + uBox.z) * su; // from the left end, scene units
+    float y = p.y * su;
+    float i = clamp(floor(xs / rw), 0.0, n - 1.0);
+    float x = xs - (i + 0.5) * rw; // across this reed
+
+    // The drop under the pointer: rr is 0 at its centre and 1 on its rim,
+    // measured in the drop's own stretched frame.
+    float w = 0.0;
+    float rr = 2.0;
+    vec2 rel = p * su - uHand.xy;
+    if (uLens.x > 0.0) {
+        vec2 sr = vec2(dot(rel, uVel.xy), dot(rel, vec2(-uVel.y, uVel.x)));
+        rr = length(sr * vec2(1.0 / uVel.z, sqrt(uVel.z))) / uLens.x;
+        w = 1.0 - smoothstep(1.0 - 1.5 * su * uPx / uLens.x, 1.0, rr);
+    }
+
+    vec3 col = vec3(0.0);
+    if (w < 1.0) {
+        col = reed(i, x, y, n, rw);
+        // Blend into the neighbour over a pixel or so at each joint, so joints
+        // stay clean at any size.
+        float toJ = 0.5 * rw - abs(x); // to the nearest joint, scene units
+        float aa = 1.2 * su;
+        if (toJ < aa) {
+            float j = i + sign(x);
+            if (j >= 0.0 && j <= n - 1.0) {
+                vec3 nb = reed(j, x - sign(x) * rw, y, n, rw);
+                col = mix(nb, col, 0.5 + 0.5 * toJ / aa);
+            }
+        }
+        // Reed lens: lighter toward its sides, a light line on each joint.
+        float u2 = 2.0 * x / rw;
+        float jl = toJ / (1.6 * su * uPx);
+        col += uLook.y * (${f(REED_LENS)} * u2 * u2 * u2 * u2 + ${f(REED_JOINT)} * exp(-jl * jl));
+    }
+    if (w > 0.0) {
+        // Through the drop the scene is seen whole: magnified at the centre,
+        // squeezed toward the rim, looking in where the reed under the
+        // pointer looks. Red bends least and blue most, so the rim fringes.
+        vec2 c0 = uHand.xy + vec2(0.0, uHand.z);
+        float t = min(rr * rr, 1.0);
+        vec2 v = rel * mix(1.0 / uLens.y, uLens.z, t);
+        vec3 lc;
+        if (uLens.w > 0.0) {
+            float dsp = uLens.w * t;
+            lc = vec3(scene(c0 + v * (1.0 - dsp)).r, scene(c0 + v).g, scene(c0 + v * (1.0 + dsp)).b);
+        } else {
+            lc = scene(c0 + v);
+        }
+        // the glass edge: a dark refraction band just inside it, a light line
+        // on the rim (brighter toward the top left), light gathered low inside
+        // the drop as a water drop focuses it, and a small highlight
+        float e1 = (rr - 0.86) / 0.07;
+        lc *= 1.0 - 0.25 * exp(-e1 * e1);
+        vec2 dir = rel / max(length(rel), 1e-3);
+        float low = max(dot(dir, vec2(0.45, 0.89)), 0.0);
+        lc += 0.24 * smoothstep(0.5, 0.92, rr) * (1.0 - smoothstep(0.92, 1.0, rr)) * low * low * vec3(1.0, 0.96, 0.9);
+        float e2 = (rr - 0.97) / max(0.035, 1.2 * su * uPx / uLens.x);
+        lc += (0.18 + 0.4 * max(dot(dir, vec2(-0.6, -0.8)), 0.0)) * exp(-e2 * e2);
+        vec2 hl = (rel / uLens.x - vec2(-0.36, -0.42)) / vec2(0.16, 0.11);
+        lc += 0.22 * exp(-dot(hl, hl));
+        col = mix(col, lc, w);
+    }
+
+    // Frost pooling along the bottom of the glass, following the end caps.
+    float ax = abs(p.x);
+    float inner = uBox.z - uRad;
+    float yb = ax <= inner ? uBox.w : uBox.w - uRad + sqrt(max(uRad * uRad - (ax - inner) * (ax - inner), 0.0));
+    float dBot = max(yb - p.y, 0.0) / H;
+    float dE = max(-sd, 0.0);
+    float frost = uLook.x * ${f(FROST_K)} * exp(-max(dBot - ${f(FROST_OFF)}, 0.0) / ${f(FROST_D)});
+    frost += uLook.x * ${f(TOP_K)} * exp(-(p.y + uBox.w) / (${f(TOP_D)} * H));
+    frost += uLook.x * ${f(HAZE_K)} * exp(-dE / (${f(HAZE_D)} * H));
+    // the drop is clear glass: the frost parts round it
+    col = mix(col, vec3(0.93, 0.93, 0.94), clamp(frost * (1.0 - 0.65 * w), 0.0, 1.0));
+
+    // Rim: a light line round the glass.
+    float lineD = dE / (0.9 * uPx);
+    col = mix(col, vec3(0.93, 0.92, 0.92), clamp(uLook.z * 0.85 * exp(-lineD * lineD), 0.0, 1.0));
+
+    outColor = vec4(clamp(col, 0.0, 1.0) * cover, cover) + vec4(0.0, 0.0, 0.0, shadow * (1.0 - cover));
+}`
+
+// ---------------------------------------------------------------- component
+
+/**
+ * @framerSupportedLayoutWidth any
+ * @framerSupportedLayoutHeight any
+ * @framerIntrinsicWidth 960
+ * @framerIntrinsicHeight 720
+ */
+export default function UmberFlute(props: UmberFluteProps) {
+    const {
+        label = DEFAULTS.label,
+        link = DEFAULTS.link,
+        onClick,
+        background = DEFAULTS.background,
+        font,
+        textColor = DEFAULTS.textColor,
+        reeds = DEFAULTS.reeds,
+        buttonWidth = DEFAULTS.buttonWidth,
+        buttonHeight = DEFAULTS.buttonHeight,
+        radius = DEFAULTS.radius,
+        scene,
+        placement,
+        response,
+        speed = DEFAULTS.speed,
+        advanced,
+        style,
+    } = props
+    const sc = { ...DEFAULT_SCENE, ...scene }
+    const pl = { ...DEFAULT_PLACEMENT, ...placement }
+    const rs = { ...DEFAULT_RESPONSE, ...response }
+    const adv = { ...DEFAULT_ADVANCED, ...advanced }
+    const fnt = { ...DEFAULT_FONT, ...font }
+
+    const rootRef = useRef<HTMLDivElement>(null)
+    const stageRef = useRef<HTMLDivElement>(null)
+    const canvasRef = useRef<HTMLCanvasElement>(null)
+    const wakeRef = useRef<() => void>(() => {})
+    const pressRef = useRef<(x: number) => void>(() => {})
+    const focusRef = useRef<(on: boolean) => void>(() => {})
+    const [size, setSize] = useState({ w: REF_W, h: REF_H })
+    const [fallback, setFallback] = useState(false)
+
+    const u = Math.min(size.h, size.w / REF_ASPECT) / REF_H
+    const bw = Math.max(80, buttonWidth)
+    const bh = Math.max(24, buttonHeight)
+    const rr = clamp(radius, 0, Math.min(bw, bh) / 2)
+    const stageW = bw + 2 * MARGIN_X * bh
+    const stageH = bh * (1 + MARGIN_T + MARGIN_B)
+
+    const family = fnt.fontFamily && !/^(sans-serif|system-ui)$/i.test(String(fnt.fontFamily).trim()) ? String(fnt.fontFamily) : WEB_FONT
+    const colorKey = [sc.ground, sc.shade, sc.ember, sc.glow].join("|")
+
+    const tfRef = useRef("") // translate · rotate · perspective; the frame adds tilt and squish
+    const tiltRef = useRef(0)
+    const tfDirtyRef = useRef(true)
+    const live = useRef({ sc, pl, rs, adv, speed, reeds, bw, bh, rr, colorKey, u })
+    live.current = { sc, pl, rs, adv, speed, reeds, bw, bh, rr, colorKey, u }
+    const clickRef = useRef(onClick)
+    clickRef.current = onClick
+
+    // Any prop change wakes a parked loop for one look, and has the frame put
+    // the squish back on the transform React just wrote.
+    useEffect(() => {
+        tfDirtyRef.current = true
+        wakeRef.current()
+    })
+
+    // The default face comes from Google Fonts; Framer loads any other itself.
+    useEffect(() => {
+        if (family !== WEB_FONT || document.querySelector("link[data-umber-font]")) return
+        const l = document.createElement("link")
+        l.rel = "stylesheet"
+        l.href = WEB_FONT_CSS
+        l.dataset.umberFont = "1"
+        document.head.appendChild(l)
+    }, [family])
+
+    useEffect(() => {
+        const root = rootRef.current
+        const stage = stageRef.current
+        const canvas = canvasRef.current
+        if (!root || !stage || !canvas) return
+        const mq = window.matchMedia("(prefers-reduced-motion: reduce)")
+
+        let clock = 0 // s of loop time
+        // pointer, in ref px from the capsule centre
+        let ptrIn = false
+        let ptrDown = false
+        let focused = false
+        let hasPtr = false
+        let cx = 0
+        let cy = 0
+        let lx = 0
+        let ly = 0
+        let ptrDirty = false
+        // eased pointer (shares of the width / height) and hover amount
+        let ex = 0
+        let exv = 0
+        let ey = 0
+        let eyv = 0
+        let hov = 0
+        let hovV = 0
+        // the drop: size (springs in with a little overshoot), the pointer's
+        // smoothed velocity in scene units/s for its stretch, and a press pulse
+        let lr = 0
+        let lrv = 0
+        let vx = 0
+        let vxv = 0
+        let vy = 0
+        let vyv = 0
+        let hxPrev = 0
+        let hyPrev = 0
+        let pz = 0
+        let pzv = 0
+        // the screen rect the pointer is read against
+        let rL = 0
+        let rT = 0
+        let rS = 1
+        // press: squish spring and the reed wobble
+        let sq = 1
+        let sqv = 0
+        let wobX = 0
+        let wobT = 99
+        let wobA = 0
+
+        // ---- WebGL
+        const gl = canvas.getContext("webgl2", {
+            alpha: true,
+            antialias: false,
+            depth: false,
+            stencil: false,
+            premultipliedAlpha: true,
+            preserveDrawingBuffer: false,
+            powerPreference: "low-power",
+        })
+        if (!gl) {
+            setFallback(true)
+            return
+        }
+        let prog: WebGLProgram | null = null
+        let vao: WebGLVertexArrayObject | null = null
+        const U: Record<string, WebGLUniformLocation | null> = {}
+        let lost = false
+        let colorsAt = ""
+
+        // uniform cache: upload only what changed
+        const uni = new Float64Array(52).fill(NaN)
+        const set1 = (slot: number, name: string, v: number) => {
+            if (uni[slot] === v) return
+            uni[slot] = v
+            gl.uniform1f(U[name], v)
+        }
+        const set3 = (slot: number, name: string, c: RGB) => {
+            if (uni[slot] === c[0] && uni[slot + 1] === c[1] && uni[slot + 2] === c[2]) return
+            uni[slot] = c[0]
+            uni[slot + 1] = c[1]
+            uni[slot + 2] = c[2]
+            gl.uniform3f(U[name], c[0] / 255, c[1] / 255, c[2] / 255)
+        }
+        const set4 = (slot: number, name: string, a: number, b: number, c: number, d: number) => {
+            if (uni[slot] === a && uni[slot + 1] === b && uni[slot + 2] === c && uni[slot + 3] === d) return
+            uni[slot] = a
+            uni[slot + 1] = b
+            uni[slot + 2] = c
+            uni[slot + 3] = d
+            gl.uniform4f(U[name], a, b, c, d)
+        }
+
+        const build = () => {
+            const sh = (type: number, src: string) => {
+                const s = gl.createShader(type)
+                if (!s) return null
+                gl.shaderSource(s, src)
+                gl.compileShader(s)
+                if (!gl.getShaderParameter(s, gl.COMPILE_STATUS) && !gl.isContextLost()) {
+                    console.warn("UmberFlute shader:", gl.getShaderInfoLog(s))
+                    return null
+                }
+                return s
+            }
+            const vs = sh(gl.VERTEX_SHADER, VS)
+            const fs = sh(gl.FRAGMENT_SHADER, FS)
+            if (!vs || !fs) return false
+            const p = gl.createProgram()
+            if (!p) return false
+            gl.attachShader(p, vs)
+            gl.attachShader(p, fs)
+            gl.linkProgram(p)
+            if (!gl.getProgramParameter(p, gl.LINK_STATUS) && !gl.isContextLost()) {
+                console.warn("UmberFlute link:", gl.getProgramInfoLog(p))
+                return false
+            }
+            prog = p
+            vao = gl.createVertexArray()
+            for (const n of ["uRes", "uBox", "uRad", "uPx", "uEdge", "uLight", "uDisc", "uReed", "uLook", "uHand", "uLens", "uVel", "uWob", "uGround", "uShade", "uEmber", "uGlow"])
+                U[n] = gl.getUniformLocation(p, n)
+            gl.useProgram(p)
+            uni.fill(NaN)
+            colorsAt = ""
+            return true
+        }
+        // No program (a GPU that cannot compile it): leave the CSS fallback showing.
+        if (!build()) {
+            setFallback(true)
+            return
+        }
+
+        // ---- colours, resolved only when they change
+        let ground: RGB = [61, 61, 61]
+        let shade: RGB = [9, 8, 12]
+        let ember: RGB = [210, 128, 46]
+        let glow: RGB = [40, 48, 88]
+        const bakeColors = () => {
+            const p = live.current
+            if (p.colorKey === colorsAt) return
+            colorsAt = p.colorKey
+            ground = resolveRGB(root, p.sc.ground, [61, 61, 61])
+            shade = resolveRGB(root, p.sc.shade, [9, 8, 12])
+            ember = resolveRGB(root, p.sc.ember, [210, 128, 46])
+            glow = resolveRGB(root, p.sc.glow, [40, 48, 88])
+        }
+
+        // ---- size
+        let W = 0
+        let H = 0
+        let shown = 1
+        let q = 1 // quality step (resolution share)
+        let wantResize = true
+        const applySize = () => {
+            const p = live.current
+            const cssW = (p.bw + 2 * MARGIN_X * p.bh) * p.u
+            const cssH = p.bh * (1 + MARGIN_T + MARGIN_B) * p.u
+            const dpr = Math.min(MAX_DPR, window.devicePixelRatio || 1)
+            let bs = Math.min(MAX_DPR, dpr * clamp(shown, 1, 2)) * q
+            bs = Math.min(bs, Math.sqrt(PIXEL_CAP / Math.max(1, cssW * cssH)))
+            const bw2 = Math.max(1, Math.round(cssW * bs))
+            const bh2 = Math.max(1, Math.round(cssH * bs))
+            if (canvas.width !== bw2) canvas.width = bw2
+            if (canvas.height !== bh2) canvas.height = bh2
+            wantResize = false
+        }
+        const ro = new ResizeObserver((es) => {
+            const r = es[0].contentRect
+            W = r.width
+            H = r.height
+            const b = root.getBoundingClientRect()
+            const s = W > 0 ? b.width / W : 1
+            if (Math.abs(s - shown) > shown * 0.05) shown = s
+            wantResize = true
+            setSize((pv) => (Math.abs(pv.w - W) < 0.5 && Math.abs(pv.h - H) < 0.5 ? pv : { w: W, h: H }))
+            wake()
+        })
+        ro.observe(root)
+
+        // ---- pointer: handlers only record; the frame maps it
+        const onMove = (e: PointerEvent) => {
+            if (e.clientX === cx && e.clientY === cy && hasPtr && e.type === "pointermove") return
+            cx = e.clientX
+            cy = e.clientY
+            hasPtr = true
+            ptrDirty = true
+            wake()
+        }
+        const onLeave = (e: PointerEvent) => {
+            if (e.pointerType === "touch" && ptrDown) return
+            hasPtr = false
+            ptrIn = false
+            ptrDown = false
+            wake()
+        }
+        const onDown = (e: PointerEvent) => {
+            onMove(e)
+            mapPointer(true)
+            if (!ptrIn) return
+            ptrDown = true
+            press(lx)
+        }
+        const onUp = (e: PointerEvent) => {
+            ptrDown = false
+            if (e.pointerType === "touch") {
+                hasPtr = false
+                ptrIn = false
+            }
+            wake()
+        }
+        const onScroll = () => {
+            if (hasPtr) ptrDirty = true
+        }
+        root.addEventListener("pointermove", onMove)
+        root.addEventListener("pointerenter", onMove)
+        root.addEventListener("pointerleave", onLeave)
+        root.addEventListener("pointerdown", onDown)
+        window.addEventListener("pointerup", onUp)
+        window.addEventListener("pointercancel", onUp)
+        window.addEventListener("scroll", onScroll, { passive: true, capture: true })
+
+        // Client px → ref px from the capsule centre, through the stage transform
+        // (translate · rotate · perspective · rotateX · squish). The rect is read
+        // only when the pointer moved or the page scrolled; while the squish
+        // springs under a still pointer the cached one is reused.
+        const mapPointer = (readRect: boolean) => {
+            if (!hasPtr) return
+            const p = live.current
+            if (readRect) {
+                ptrDirty = false
+                const r = root.getBoundingClientRect()
+                rL = r.left
+                rT = r.top
+                rS = W > 0 ? r.width / W : 1
+            }
+            const X0 = (cx - rL) / rS - (W / 2 + (p.pl.x / 100) * W)
+            const Y0 = (cy - rT) / rS - (H / 2 + (p.pl.y / 100) * H)
+            const an = (-p.pl.angle * Math.PI) / 180
+            const X = X0 * Math.cos(an) - Y0 * Math.sin(an)
+            const Y = X0 * Math.sin(an) + Y0 * Math.cos(an)
+            const th = (clamp(p.pl.tilt, -80, 80) * Math.PI) / 180
+            const P = PERSPECTIVE * p.u
+            const den = P * Math.cos(th) + Y * Math.sin(th)
+            const yy = Math.abs(den) > 1e-6 ? (Y * P) / den : 0
+            const xx = (X * (P - yy * Math.sin(th))) / P
+            lx = xx / p.u / sq
+            ly = yy / p.u / sq
+            ptrIn = sdRoundRect(lx, ly, p.bw / 2, p.bh / 2, p.rr) < (ptrIn ? 4 : 0)
+        }
+
+        const press = (x: number) => {
+            if (mq.matches) return
+            const p = live.current
+            wobX = (x / p.bh) * UNIT_H
+            wobT = 0
+            wobA = (p.rs.ripple / 5) * WOBBLE
+            sqv -= 0.9
+            pzv += 9
+            wake()
+        }
+        pressRef.current = (x) => press(x)
+        focusRef.current = (on) => {
+            focused = on
+            wake()
+        }
+
+        let onScreen = true
+        let tabVisible = !document.hidden
+        const io = new IntersectionObserver((es) => {
+            onScreen = es[es.length - 1].isIntersecting
+            wake()
+        })
+        io.observe(root)
+        const onVis = () => {
+            tabVisible = !document.hidden
+            wake()
+        }
+        document.addEventListener("visibilitychange", onVis)
+        const onLost = (e: Event) => {
+            e.preventDefault()
+            lost = true
+        }
+        const onRestore = () => {
+            lost = false
+            if (build()) {
+                wantResize = true
+                wake()
+            }
+        }
+        canvas.addEventListener("webglcontextlost", onLost)
+        canvas.addEventListener("webglcontextrestored", onRestore)
+        mq.addEventListener?.("change", wake)
+
+        // ---- per-frame motion: critically damped springs, settled exactly
+        const spring = (x: number, v: number, to: number, w: number, dt: number, z = 2): [number, number] => {
+            v += (w * w * (to - x) - z * w * v) * dt
+            x += v * dt
+            if (Math.abs(x - to) < 1e-4 && Math.abs(v) < 1e-3) return [to, 0]
+            return [x, v]
+        }
+        const step = (dt: number) => {
+            const p = live.current
+            const reduced = mq.matches
+            clock += dt * (reduced ? 0 : clamp(p.speed, 0, 10) / 5)
+            const hot = (ptrIn || ptrDown) && !reduced
+            // follow in ~100 ms; drift home when the pointer leaves
+            const tx = hot ? clamp(lx / p.bw, -0.5, 0.5) : 0
+            const ty = hot ? clamp(ly / p.bh, -0.5, 0.5) : 0
+            ;[ex, exv] = spring(ex, exv, tx, hot ? 46 : 14, dt)
+            ;[ey, eyv] = spring(ey, eyv, ty, hot ? 46 : 14, dt)
+            ;[hov, hovV] = spring(hov, hovV, hot || (focused && !reduced) ? 1 : 0, 20, dt)
+            // the drop swells in with a little overshoot, and shrinks away
+            ;[lr, lrv] = spring(lr, lrv, hot || (focused && !reduced) ? 1 : 0, 16, dt, 1.1)
+            // it stretches along the pointer's travel (smoothed, scene units/s)
+            const hx = ex * (p.bw / p.bh) * UNIT_H
+            const hy = ey * UNIT_H
+            const rvx = dt > 0 ? (hx - hxPrev) / dt : 0
+            const rvy = dt > 0 ? (hy - hyPrev) / dt : 0
+            hxPrev = hx
+            hyPrev = hy
+            ;[vx, vxv] = spring(vx, vxv, rvx, 14, dt)
+            ;[vy, vyv] = spring(vy, vyv, rvy, 14, dt)
+            ;[pz, pzv] = spring(pz, pzv, 0, 22, dt, 0.7)
+            ;[sq, sqv] = spring(sq, sqv, ptrDown && ptrIn && !reduced ? SQUISH : 1, 34, dt, 0.9)
+            if (wobT < 99) {
+                wobT += dt
+                if (wobA * Math.exp(-WOBBLE_DECAY * wobT) < 0.05) wobT = 99
+            }
+        }
+
+        // ---- draw
+        const draw = () => {
+            if (lost || !prog) return
+            const p = live.current
+            if (wantResize) applySize()
+            bakeColors()
+            gl.viewport(0, 0, canvas.width, canvas.height)
+            gl.useProgram(prog)
+            gl.bindVertexArray(vao)
+
+            const k = canvas.width / ((p.bw + 2 * MARGIN_X * p.bh) * p.u) // buffer px per stage CSS px
+            const unit = k * p.u // buffer px per ref px
+            const hw = (p.bw / 2) * unit
+            const hh = (p.bh / 2) * unit
+            gl.uniform2f(U.uRes, canvas.width, canvas.height)
+            set4(0, "uBox", canvas.width / 2, (MARGIN_T * p.bh + p.bh / 2) * unit, hw, hh)
+            set1(4, "uRad", p.rr * unit)
+            set1(5, "uPx", k)
+
+            const ph = (clock / LOOP_S) * Math.PI * 2
+            const co = Math.cos(ph)
+            const si = Math.sin(ph)
+            set4(8, "uEdge", harm(EDGE_A0, co, si), harm(EDGE_A1, co, si), harm(EDGE_A2, co, si), 0)
+            gl.uniform2f(U.uLight, Math.max(0, harm(POOL_K, co, si)), Math.max(0, harm(GLOW_K, co, si)))
+            set4(12, "uDisc", harm(DISC_X, co, si), harm(DISC_Y, co, si), harm(DISC_R, co, si), Math.round(clamp(p.reeds, 2, 16)))
+            // The step is set for six reeds; more reeds share the same total.
+            const n = Math.round(clamp(p.reeds, 2, 16))
+            const stepY = REED_DY * (p.adv.step / 100) * (REEDS / n)
+            gl.uniform2f(U.uReed, REED_M * (p.adv.refraction / 100), stepY)
+            set4(20, "uLook", p.adv.frost / 100, p.adv.joints / 100, p.adv.rim / 100, p.adv.shadow / 100)
+            // The drop looks into the scene where the reed under the pointer
+            // does; that reed's step is taken continuously so the view never
+            // jumps as the pointer crosses a joint.
+            const ri = clamp((ex + 0.5) * n - 0.5, 0, n - 1)
+            set4(24, "uHand", ex * (p.bw / p.bh) * UNIT_H, ey * UNIT_H, (ri - 0.5 * (n - 1)) * stepY, 0)
+            const R = Math.max(0, lr) * (p.rs.lens / 5) * LENS_R
+            const bend = p.rs.bend / 5
+            const mag = Math.max(0.3, 1 + (LENS_MAG - 1) * bend * (1 + PULSE * pz))
+            set4(44, "uLens", R > 0.5 ? R : 0, mag, 1 + (LENS_RIM - 1) * bend, (p.rs.prism / 5) * PRISM)
+            const sp = Math.hypot(vx, vy)
+            gl.uniform3f(U.uVel, sp > 1e-3 ? vx / sp : 1, sp > 1e-3 ? vy / sp : 0, 1 + STRETCH * Math.tanh(sp / STRETCH_V))
+            const wa = wobT < 99 ? wobA * Math.exp(-WOBBLE_DECAY * wobT) : 0
+            set4(28, "uWob", wobX, wa, wobT < 99 ? wobT : 0, 0)
+            set3(32, "uGround", ground)
+            set3(35, "uShade", shade)
+            set3(38, "uEmber", ember)
+            set3(41, "uGlow", glow)
+            gl.drawArrays(gl.TRIANGLES, 0, 3)
+        }
+
+        // ---- loop: vsync-locked 60 fps while anything moves, parked otherwise
+        let raf = 0
+        let lastTick = -1
+        let lastDraw = -1
+        const gaps = new Float64Array(9)
+        const sorted = new Float64Array(9)
+        let gi = 0
+        let gn = 0
+        let every = 1
+        let tick = 0
+        let slowFor = 0
+        let fastFor = 0
+        let lastTf = ""
+        const frame = (now: number) => {
+            raf = 0
+            if (!onScreen || !tabVisible || lost) {
+                lastTick = -1
+                lastDraw = -1
+                return
+            }
+            if (lastTick >= 0) {
+                gaps[gi] = now - lastTick
+                gi = (gi + 1) % 9
+                gn = Math.min(9, gn + 1)
+            }
+            lastTick = now
+            if (gn >= 5) {
+                for (let i = 0; i < gn; i++) sorted[i] = gaps[i]
+                const period = sorted.subarray(0, gn).sort()[gn >> 1]
+                const x = 16.7 / Math.max(1, period)
+                if (x < every - 0.1 || x >= every + 1.1) every = Math.max(1, Math.floor(x + 0.1))
+            }
+            if (++tick < every) {
+                raf = requestAnimationFrame(frame)
+                return
+            }
+            tick = 0
+            const dt = lastDraw < 0 ? 1 / 60 : Math.min(0.1, (now - lastDraw) / 1000)
+            // A weak GPU drawing late steps the buffer down (floor 0.6) and wins it back.
+            if (lastDraw >= 0) {
+                const late = now - lastDraw > clamp(every * 16.7, 16, 33.4) * 1.45
+                slowFor = late ? slowFor + dt : 0
+                fastFor = late ? 0 : fastFor + dt
+                if (slowFor > 0.6 && q > 0.61) {
+                    q = Math.max(0.6, q - 0.2)
+                    slowFor = 0
+                    fastFor = 0
+                    wantResize = true
+                } else if (fastFor > 5 && q < 1) {
+                    q = Math.min(1, q + 0.2)
+                    fastFor = -10 // hold the raise a while before trying again
+                    wantResize = true
+                }
+            }
+            lastDraw = now
+            if (ptrDirty || sqv !== 0) mapPointer(ptrDirty)
+            step(dt)
+            const p = live.current
+            const looping = !mq.matches && p.speed > 0
+            const springs = exv !== 0 || eyv !== 0 || hovV !== 0 || sqv !== 0 || lrv !== 0 || vxv !== 0 || vyv !== 0 || pzv !== 0 || wobT < 99
+            // The press squish rides the stage's own transform, label included.
+            const tf = tfRef.current + ` rotateX(${tiltRef.current.toFixed(4)}rad)` + (sq !== 1 ? ` scale(${sq.toFixed(4)})` : "")
+            if (tf !== lastTf || tfDirtyRef.current) {
+                stage.style.transform = tf
+                lastTf = tf
+                tfDirtyRef.current = false
+            }
+            draw()
+            if (looping || springs) raf = requestAnimationFrame(frame)
+            else {
+                lastTick = -1
+                lastDraw = -1
+                if (q < 1) {
+                    q = 1
+                    wantResize = true
+                    draw()
+                }
+            }
+        }
+        function wake() {
+            if (raf === 0) raf = requestAnimationFrame(frame)
+        }
+        wakeRef.current = wake
+        wake()
+
+        return () => {
+            cancelAnimationFrame(raf)
+            raf = -1
+            wakeRef.current = () => {}
+            pressRef.current = () => {}
+            focusRef.current = () => {}
+            ro.disconnect()
+            io.disconnect()
+            root.removeEventListener("pointermove", onMove)
+            root.removeEventListener("pointerenter", onMove)
+            root.removeEventListener("pointerleave", onLeave)
+            root.removeEventListener("pointerdown", onDown)
+            window.removeEventListener("pointerup", onUp)
+            window.removeEventListener("pointercancel", onUp)
+            window.removeEventListener("scroll", onScroll, { capture: true })
+            document.removeEventListener("visibilitychange", onVis)
+            canvas.removeEventListener("webglcontextlost", onLost)
+            canvas.removeEventListener("webglcontextrestored", onRestore)
+            mq.removeEventListener?.("change", wake)
+        }
+    }, [])
+
+    // ---- layout: the stage carries the canvas and the click target, placed
+    const px = (v: number) => `${v.toFixed(2)}px`
+    const sw = stageW * u
+    const sh = stageH * u
+    const tilt = (clamp(pl.tilt, -80, 80) * Math.PI) / 180
+    const tfBase =
+        `translate(${px((pl.x / 100) * size.w)}, ${px((pl.y / 100) * size.h)}) rotate(${pl.angle}deg) ` +
+        `perspective(${px(PERSPECTIVE * u)})`
+    const stageTf = `${tfBase} rotateX(${tilt.toFixed(4)}rad)`
+    tfRef.current = tfBase
+    tiltRef.current = tilt
+    // The stage is centred on the capsule, so its box sits lower than the frame's centre.
+    const capCy = (MARGIN_T * bh + bh / 2) * u
+    const external = /^https?:\/\//i.test(link)
+    const fam = family === WEB_FONT ? FALLBACK_STACK : /["',]/.test(family) ? family : `"${family}"`
+    const targetStyle: CSSProperties = {
+        position: "absolute",
+        left: px(MARGIN_X * bh * u),
+        top: px(MARGIN_T * bh * u),
+        width: px(bw * u),
+        height: px(bh * u),
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        boxSizing: "border-box",
+        padding: 0,
+        margin: 0,
+        border: "none",
+        borderRadius: px(rr * u),
+        background: fallback
+            ? `linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0) 30%, rgba(236,236,240,0.55) 100%), linear-gradient(100deg, ${sc.ground} 0%, ${sc.shade} 45%, ${sc.ground} 70%, ${sc.shade} 100%)`
+            : "transparent",
+        boxShadow: fallback ? "inset 0 0 0 1.5px rgba(236,235,235,0.85)" : "none",
+        cursor: "pointer",
+        textDecoration: "none",
+        color: textColor,
+        fontFamily: fam,
+        fontWeight: fnt.fontWeight ?? 500,
+        fontStyle: fnt.fontStyle || "normal",
+        letterSpacing: fnt.letterSpacing ?? "0em",
+        fontSize: px((fontPx(fnt.fontSize) ?? LABEL_SIZE * bh) * u),
+        lineHeight: 1,
+        textAlign: "center",
+        whiteSpace: "nowrap",
+        WebkitTapHighlightColor: "transparent",
+        outlineOffset: px(4 * u),
+        pointerEvents: "auto",
+        touchAction: "pan-y",
+    }
+    // Centred on the letters themselves: text-box trims the line to cap height
+    // and baseline (Inter's ascent and descent are uneven, so a plain line box
+    // sits the type high), and the indent balances the tracking the last letter
+    // carries on its right.
+    const labelEl = (
+        <span
+            style={
+                {
+                    display: "block",
+                    textAlign: "center",
+                    textIndent: fnt.letterSpacing ?? "0em",
+                    textBoxTrim: "trim-both",
+                    textBoxEdge: "cap alphabetic",
+                    pointerEvents: "none",
+                } as CSSProperties
+            }
+        >
+            {label}
+        </span>
+    )
+    const handlers = {
+        onClick: () => clickRef.current?.(),
+        onFocus: (e: { currentTarget: HTMLElement }) => focusRef.current(e.currentTarget.matches(":focus-visible")),
+        onBlur: () => focusRef.current(false),
+        onKeyDown: (e: ReactKeyboardEvent) => {
+            if (e.key === "Enter" || e.key === " ") pressRef.current(0)
+        },
+    }
+
+    return (
+        <div
+            ref={rootRef}
+            style={{
+                position: "relative",
+                width: "100%",
+                height: "100%",
+                aspectRatio: `${REF_W} / ${REF_H}`,
+                ...style,
+                background,
+                overflow: "hidden",
+                userSelect: "none",
+                WebkitUserSelect: "none",
+                touchAction: "pan-y",
+            }}
+        >
+            <div
+                ref={stageRef}
+                style={{
+                    position: "absolute",
+                    left: px(size.w / 2 - sw / 2),
+                    top: px(size.h / 2 - capCy),
+                    width: px(sw),
+                    height: px(sh),
+                    transform: stageTf,
+                    transformOrigin: `50% ${px(capCy)}`,
+                    pointerEvents: "none",
+                }}
+            >
+                <canvas
+                    ref={canvasRef}
+                    aria-hidden
+                    style={{ position: "absolute", inset: 0, width: "100%", height: "100%", display: fallback ? "none" : "block" }}
+                />
+                {link ? (
+                    <a
+                        href={link}
+                        target={external ? "_blank" : undefined}
+                        rel={external ? "noopener noreferrer" : undefined}
+                        draggable={false}
+                        style={targetStyle}
+                        {...handlers}
+                    >
+                        {labelEl}
+                    </a>
+                ) : (
+                    <button type="button" style={targetStyle} {...handlers}>
+                        {labelEl}
+                    </button>
+                )}
+            </div>
+        </div>
+    )
+}
+
+// Control order arranged in the builder.
+addPropertyControls(UmberFlute, {
+    // ── Background
+    background: { type: ControlType.Color, title: "Background", defaultValue: DEFAULTS.background },
+    textColor: { type: ControlType.Color, title: "Text Color", defaultValue: DEFAULTS.textColor },
+    onClick: { type: ControlType.EventHandler, title: "On Click" },
+    scene: {
+        type: ControlType.Object,
+        title: "Scene",
+        controls: {
+            ground: { type: ControlType.Color, title: "Ground", defaultValue: "#2B164B", description: "The pale ground behind the glass." },
+            shade: { type: ControlType.Color, title: "Shade", defaultValue: "#140000", description: "The dark bodies turning behind it." },
+            ember: { type: ControlType.Color, title: "Ember", defaultValue: "#832ED2", description: "The thin light along the bodies' edges." },
+            glow: { type: ControlType.Color, title: "Glow", defaultValue: "#402858", description: "The light that washes in from the left mid-loop." },
+        },
+    },
+    // ── Content
+    label: { type: ControlType.String, title: "Label", defaultValue: DEFAULTS.label },
+    // ── Text
+    font: {
+        type: ControlType.Font,
+        title: "Font",
+        controls: "extended",
+        defaultFontType: "sans-serif",
+        defaultValue: {"variant":"Bold","fontSize":"56px","textAlign":"left","fontFamily":"Inter","fontWeight":700,"lineHeight":"1.5em","letterSpacing":"-0.01em"},
+        description: "Size is in px at the 960 × 720 design size and scales with the frame.",
+    },
+    link: {
+        type: ControlType.Link,
+        title: "Link",
+        description: "An external page opens in a new tab; anything else navigates here.",
+    },
+    // ── Structure
+    reeds: {
+        type: ControlType.Number,
+        title: "Reeds",
+        min: 2,
+        max: 16,
+        step: 1,
+        defaultValue: DEFAULTS.reeds,
+        displayStepper: true,
+        description: "How many reeds of glass run across the button.",
+    },
+    // ── Element
+    buttonWidth: {
+        type: ControlType.Number,
+        title: "Button Width",
+        unit: "px",
+        min: 120,
+        max: 900,
+        step: 1,
+        defaultValue: DEFAULTS.buttonWidth,
+    },
+    buttonHeight: {
+        type: ControlType.Number,
+        title: "Button Height",
+        unit: "px",
+        min: 40,
+        max: 400,
+        step: 1,
+        defaultValue: DEFAULTS.buttonHeight,
+        description: "Also sizes the type, the frost and the scene.",
+    },
+    radius: {
+        type: ControlType.Number,
+        title: "Radius",
+        unit: "px",
+        min: 0,
+        max: 200,
+        step: 1,
+        defaultValue: DEFAULTS.radius,
+        description: "Half the height or more makes a capsule.",
+    },
+    // ── Placement
+    placement: {
+        type: ControlType.Object,
+        title: "Placement",
+        controls: {
+            x: {
+                type: ControlType.Number,
+                title: "X Offset",
+                unit: "%",
+                min: -50,
+                max: 50,
+                step: 0.5,
+                defaultValue: 0,
+                description: "Share of the frame's width. Positive moves right.",
+            },
+            y: {
+                type: ControlType.Number,
+                title: "Y Offset",
+                unit: "%",
+                min: -50,
+                max: 50,
+                step: 0.5,
+                defaultValue: 0,
+                description: "Share of the frame's height. Positive moves down.",
+            },
+            angle: {
+                type: ControlType.Number,
+                title: "Angle",
+                unit: "°",
+                min: -180,
+                max: 180,
+                step: 1,
+                defaultValue: 0,
+                description: "Turns the button about its centre. Positive is clockwise.",
+            },
+            tilt: {
+                type: ControlType.Number,
+                title: "Tilt",
+                unit: "°",
+                min: -80,
+                max: 80,
+                step: 1,
+                defaultValue: 0,
+                description: "Leans the button back. Positive tips its top away.",
+            },
+        },
+    },
+    // ── Response
+    response: {
+        type: ControlType.Object,
+        title: "Response",
+        controls: {
+            lens: {
+                type: ControlType.Number,
+                title: "Lens",
+                min: 0,
+                max: 10,
+                step: 0.1,
+                defaultValue: 5,
+                description: "How big the drop of clear glass under the pointer is. 0 turns it off.",
+            },
+            bend: {
+                type: ControlType.Number,
+                title: "Bend",
+                min: 0,
+                max: 10,
+                step: 0.1,
+                defaultValue: 5,
+                description: "How strongly the drop refracts: magnified at its centre, squeezed at its rim. 0 is a flat clear window.",
+            },
+            prism: {
+                type: ControlType.Number,
+                title: "Prism",
+                min: 0,
+                max: 10,
+                step: 0.1,
+                defaultValue: 5,
+                description: "The colour fringe the drop splits light into toward its rim.",
+            },
+            ripple: {
+                type: ControlType.Number,
+                title: "Ripple",
+                min: 0,
+                max: 10,
+                step: 0.1,
+                defaultValue: 5,
+                description: "How hard a press makes the reeds wobble.",
+            },
+        },
+    },
+    // ── Travel
+    speed: {
+        type: ControlType.Number,
+        title: "Speed",
+        min: 0,
+        max: 10,
+        step: 0.1,
+        defaultValue: DEFAULTS.speed,
+        description: "How fast the scene turns. 5 is the reference's 3.1 s loop; 0 holds it still.",
+    },
+    // ── Advanced
+    advanced: {
+        type: ControlType.Object,
+        title: "Advanced",
+        controls: {
+            refraction: {
+                type: ControlType.Number,
+                title: "Refraction",
+                unit: "%",
+                min: 10,
+                max: 400,
+                step: 1,
+                defaultValue: 10,
+                description: "How wide a strip of the scene each reed shows. Lower stretches it more.",
+            },
+            step: {
+                type: ControlType.Number,
+                title: "Step",
+                unit: "%",
+                min: 0,
+                max: 300,
+                step: 1,
+                defaultValue: 187,
+                description: "How far each reed sits below its neighbour in the scene.",
+            },
+            frost: {
+                type: ControlType.Number,
+                title: "Frost",
+                unit: "%",
+                min: 0,
+                max: 200,
+                step: 1,
+                defaultValue: 14,
+                description: "The milky frost pooling along the bottom and round the edge.",
+            },
+            joints: {
+                type: ControlType.Number,
+                title: "Joints",
+                unit: "%",
+                min: 0,
+                max: 300,
+                step: 1,
+                defaultValue: 0,
+                description: "The light on the reed joints and toward each reed's sides.",
+            },
+            rim: {
+                type: ControlType.Number,
+                title: "Rim",
+                unit: "%",
+                min: 0,
+                max: 200,
+                step: 1,
+                defaultValue: 23,
+                description: "The light line round the glass.",
+            },
+            shadow: {
+                type: ControlType.Number,
+                title: "Shadow",
+                unit: "%",
+                min: 0,
+                max: 300,
+                step: 1,
+                defaultValue: 0,
+                description: "The soft shadow under the button.",
+            },
+        },
+    },
+})
