@@ -1,0 +1,1225 @@
+/* eslint-disable */
+// Sapphire Armillary — Originkit
+
+"use client"
+
+/**
+ * SapphireArmillary — a frosted sapphire four-point star floating inside three
+ * clear glass rings, like an armillary sphere on a grey studio sweep. Built
+ * from a reference still the user supplied (a 3D render, source unnamed).
+ *
+ * Everything is ray-marched in one pass, only inside the rig's bounding
+ * circle. The rings are liquid-glass tori: hollow (clear through the middle,
+ * a dark line just inside each edge where light runs the length of a wall, a
+ * mirror rim at the edge), lensing what is behind with a touch of colour
+ * fringing, with a caustic line and crisp glints; their silhouettes are
+ * anti-aliased from how closely each ray misses them. The star is the
+ * four-point sparkle inflated like a balloon, a clear blue shell around a
+ * darker inner star that slides with parallax as it turns; its colour comes
+ * from how much glass a ray crosses — thin edges glow cyan, the body runs
+ * royal blue, the core sinks to navy — under a frosted halo.
+ *
+ * Motion: the rings counter-rotate like a gyroscope at constant, locked rates
+ * (or rock together on one shared sway). Pointer: the star turns to look at
+ * the cursor and drifts a little toward it on a slightly under-damped spring;
+ * the rings lean the other way.
+ *
+ * @framerSupportedLayoutWidth any
+ * @framerSupportedLayoutHeight any
+ * @framerIntrinsicWidth 1200
+ * @framerIntrinsicHeight 800
+ */
+import { addPropertyControls, ControlType } from "framer"
+import { useEffect, useRef, useState, type CSSProperties } from "react"
+
+// ── moved controls (builder) ──
+/**
+ * Controls moved in the builder: into Advanced, out of it, or into groups of
+ * their own. The code reads each one where it was first written, so the props
+ * are put back in that shape before anything reads them.
+ */
+const MOVED_CONTROLS: { into: Record<string, string>; out: Record<string, string> } = {"into":{"ringTint":"advanced"},"out":{}}
+const GROUP_FALLBACKS: Record<string, any> = {  }
+function withMovedControls(props: any): any {
+    const out = { ...props }
+    for (const [k, g] of Object.entries(MOVED_CONTROLS.into)) out[k] = props?.[g]?.[k] ?? GROUP_FALLBACKS[g]?.[k]
+    for (const [k, g] of Object.entries(MOVED_CONTROLS.out)) {
+        if (out[k] !== undefined) out[g] = { ...(out[g] ?? {}), [k]: out[k] }
+    }
+    return out
+}
+// ── /moved controls ──
+
+type RGBA = [number, number, number, number]
+
+const COLOR_CACHE = new Map<string, RGBA | null>()
+
+/** Cached per string, so the frame loop parses nothing and allocates nothing. */
+function parseColor(input: string | undefined, fallback: RGBA): RGBA {
+    if (typeof input !== "string") return fallback
+    let hit = COLOR_CACHE.get(input)
+    if (hit === undefined) {
+        hit = parseColorRaw(input)
+        COLOR_CACHE.set(input, hit)
+    }
+    return hit ?? fallback
+}
+
+function parseColorRaw(raw: string): RGBA | null {
+    let s = raw.trim()
+    const v = /^var\(\s*--[^,]+,\s*(.+)\)$/.exec(s)
+    if (v) s = v[1].trim()
+    if (s[0] === "#") {
+        const h = s.slice(1)
+        const x = (a: string) => parseInt(a, 16)
+        let r: number, g: number, b: number, a = 255
+        if (h.length === 3 || h.length === 4) {
+            r = x(h[0] + h[0]); g = x(h[1] + h[1]); b = x(h[2] + h[2])
+            if (h.length === 4) a = x(h[3] + h[3])
+        } else if (h.length === 6 || h.length === 8) {
+            r = x(h.slice(0, 2)); g = x(h.slice(2, 4)); b = x(h.slice(4, 6))
+            if (h.length === 8) a = x(h.slice(6, 8))
+        } else return null
+        const out: RGBA = [r / 255, g / 255, b / 255, a / 255]
+        return out.every(Number.isFinite) ? out : null
+    }
+    const m = /^(rgba?|hsla?)\(([^)]*)\)$/i.exec(s)
+    if (!m) return null
+    const parts = m[2].split(/[\s,/]+/).filter(Boolean)
+    if (parts.length < 3) return null
+    const num = (p: string, scale: number) => (p.endsWith("%") ? (parseFloat(p) / 100) * scale : parseFloat(p))
+    const alpha = parts.length > 3 ? num(parts[3], 1) : 1
+    let rgb: [number, number, number]
+    if (m[1].toLowerCase().startsWith("rgb")) {
+        rgb = [num(parts[0], 255) / 255, num(parts[1], 255) / 255, num(parts[2], 255) / 255]
+    } else {
+        const hh = (((parseFloat(parts[0]) % 360) + 360) % 360) / 360
+        const ss = num(parts[1], 1), ll = num(parts[2], 1)
+        const q = ll < 0.5 ? ll * (1 + ss) : ll + ss - ll * ss
+        const p = 2 * ll - q
+        const f = (t: number) => {
+            t = (t + 1) % 1
+            if (t < 1 / 6) return p + (q - p) * 6 * t
+            if (t < 1 / 2) return q
+            if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6
+            return p
+        }
+        rgb = [f(hh + 1 / 3), f(hh), f(hh - 1 / 3)]
+    }
+    const out: RGBA = [rgb[0], rgb[1], rgb[2], alpha]
+    return out.every(Number.isFinite) ? (out.map((c) => Math.min(1, Math.max(0, c))) as RGBA) : null
+}
+
+function num(v: unknown, d: number): number {
+    return typeof v === "number" && Number.isFinite(v) ? v : d
+}
+const clampN = (v: unknown, lo: number, hi: number, d: number) => Math.max(lo, Math.min(hi, num(v, d)))
+
+// ── defaults: one source of truth for the signature and the panel ──
+
+const DEFAULTS = {
+    background: "#000000",
+    rings: 6,
+    scale: 56,
+    ringTint: "#DDE3E8",
+    follow: true,
+    orbit: "spin",
+    speed: 8.4,
+}
+
+const DEFAULT_STAR = { glow: "#12B4C2", body: "#0B2E9A", core: "#06114F", frost: 5 }
+type Star = typeof DEFAULT_STAR
+
+const DEFAULT_PLACEMENT = { x: 0, y: 0, angle: 0, tilt: 0 }
+type Placement = typeof DEFAULT_PLACEMENT
+
+const DEFAULT_RESPONSE = { look: 5, drift: 4, parallax: 3 }
+type Response = typeof DEFAULT_RESPONSE
+
+/** Tuning values behind the look. Out of the box Advanced changes nothing. */
+const DEFAULT_ADVANCED = {
+    starSize: 68,
+    waist: 56,
+    puff: 46,
+    dome: 80,
+    middleRadius: 93,
+    innerRadius: 78,
+    outerTube: 5.2,
+    middleTube: 4,
+    innerTube: 5.2,
+    middleLean: 65,
+    innerTurn: 64,
+    lens: 2.6,
+    restYaw: -20,
+    restPitch: 8,
+    restRoll: 5,
+    wall: 30,
+    ior: 1.45,
+    depth: 2.0,
+    gloss: 28,
+    swing: 22,
+    bob: 3,
+    followMs: 380,
+}
+type Advanced = typeof DEFAULT_ADVANCED
+
+export interface SapphireArmillaryProps {
+    /** The studio ground; also what the glass rings show through them. */
+    background?: string
+    /** How many rings: 3 is outer, middle and inner; more nest further inward, each thinner than the last; 0 leaves the star alone. */
+    rings?: number
+    /** How big the rig draws; 100% is the reference framing. */
+    scale?: number
+    /** Star colours: Glow (thin edges), Body, Core (thickest glass), and Frost (edge softness). */
+    star?: Partial<Star>
+    /** Tint the rings pick up where light crosses most glass. */
+    ringTint?: string
+    placement?: Partial<Placement>
+    /** Star looks at and drifts toward the cursor; rings lean away. */
+    follow?: boolean
+    response?: Partial<Response>
+    /** Sway rocks the rings about the reference pose; Spin turns them right round, gyroscope-style. */
+    orbit?: "sway" | "spin"
+    /** 0–10 rate of the rings' motion and the star's float; 0 holds the pose. */
+    speed?: number
+    advanced?: Partial<Advanced>
+    style?: CSSProperties
+}
+
+const D2R = Math.PI / 180
+/** Bounding radius of the whole rig (outer ring = 1) beyond its thickest tube, room for the halo. */
+const RIG_PAD = 0.07
+/** Hard cap on the ring stack: the shader's uRingM/uRingR/uRingT arrays are sized to this. */
+const MAX_RINGS = 6
+/** Device pixels the ray-march may cover; a 4K frame steps down instead of heating the laptop. */
+const PIXEL_BUDGET = 1.1e6
+/** Fixed spring substep, so 60 Hz and 120 Hz screens move the star identically. */
+const STEP = 1 / 120
+/** Spring damping ratio: just under critical, so the star settles with a breath of overshoot. */
+const ZETA = 0.72
+/** Ring motion at Speed 5, rad/s: Spin's inner ring turns once in ~21 s; Sway rocks once in ~13 s. */
+const SPIN_RATE = 0.3
+const SWAY_RATE = 0.5
+/** The star's float, rad/s at Speed 5: one slow circle every ~16 s, bobbing twice per circle. */
+const FLOAT_RATE = 0.4
+/** Outer ring's resting yaw: a few degrees off face-on gives its tube the reference's uneven width. */
+const OUTER_YAW = 8
+
+const VERT = `#version 300 es
+uniform vec2 uRes;
+uniform vec2 uCenter;
+uniform float uQuad;
+void main(){
+  vec2 v = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1)) * 2.0 - 1.0;
+  gl_Position = vec4((uCenter + v * uQuad) / uRes * 2.0 - 1.0, 0.0, 1.0);
+}`
+
+const FRAG = `#version 300 es
+precision highp float;
+uniform vec2 uCenter;
+uniform float uFocal;
+uniform float uQR;
+uniform float uCamD;
+uniform float uRB;
+uniform vec2 uRollCS;
+uniform vec2 uTiltCS;
+uniform mat3 uRingM[6];
+uniform float uRingR[6];
+uniform float uRingT[6];
+uniform int uRingN;
+uniform mat3 uStarM;
+uniform vec3 uStarP;
+uniform float uStarS;
+uniform vec4 uStarK;
+uniform vec2 uStarW;
+uniform vec3 uGlow;
+uniform vec3 uBody;
+uniform vec3 uCore;
+uniform vec3 uTint;
+uniform vec3 uEnv;
+uniform float uFrost;
+uniform float uHalo;
+uniform float uIor;
+uniform float uDensity;
+uniform float uGloss;
+uniform float uWall;
+uniform float uBgA;
+out vec4 outColor;
+
+// Key light, unit length: from the right and above, nearly side-on, so the walls turned toward
+// it glow cyan while the faces turned to camera stay deep (as in the reference).
+const vec3 KEY = vec3(0.7827, 0.5820, 0.2208);
+// Size of the dark inner star against the shell.
+const float CORE_K = 0.66;
+// The overhead softbox, unit length.
+const vec3 TOP = vec3(0.0, 0.9578, 0.2873);
+
+// Every smoothstep here has edge0 < edge1: the reverse is undefined in GLSL, and some GPUs
+// return garbage for it (that is what painted the rings black).
+
+// The studio the glass sees, read off the reference's rings: the grey sweep behind, a tall
+// bright softbox on the right (the hard line that walks round each tube), a weaker one
+// overhead, a darker left wall and floor.
+vec3 env(vec3 d) {
+    vec3 c = uEnv * mix(0.72, 1.0, smoothstep(-0.05, 0.45, -d.z));
+    c = mix(c, uEnv * 1.04, smoothstep(0.1, 0.7, d.z));
+    c *= mix(1.0, 0.8, smoothstep(0.3, 0.75, -d.x));
+    c += vec3(2.4) * smoothstep(0.5, 0.72, d.x) * (1.0 - smoothstep(0.3, 0.8, abs(d.y)));
+    c += vec3(0.9) * smoothstep(0.62, 0.9, d.y);
+    c *= mix(1.0, 0.75, smoothstep(0.35, 0.85, -d.y));
+    return c;
+}
+
+// torus around local z, tube radius r
+float sdTor(vec3 q, float R, float r) {
+    return length(vec2(length(q.xy) - R, q.z)) - r;
+}
+
+// four-point sparkle in star units: a diamond with each side scooped by a circle, tips rounded.
+// The fold onto the axes and the diamond/arc join are both rounded off, so the inflated star
+// has no creases down its arms or facets at its tips: soft blown glass, not cut.
+// uStarK = (tip, arc centre, arc radius, tip rounding)
+float star2(vec2 p) {
+    vec2 a = sqrt(p * p + 0.0025);
+    float dia = (a.x + a.y - uStarK.x) * 0.70710678;
+    float arc = uStarK.z - length(a - vec2(uStarK.y));
+    float hk = max(0.08 - abs(dia - arc), 0.0) / 0.08;
+    return max(dia, arc) + hk * hk * 0.02 - uStarK.w;
+}
+
+// The sparkle inflated like a balloon: across any edge its section is a quarter ellipse of
+// radii (W, W*ZS), so it swells smoothly from a rounded rim to a thick middle, and each arm
+// keeps a soft ridge down its length. uStarW = (W, ZS). Ellipse distance after iq.
+float mapS(vec3 p) {
+    vec3 q = uStarM * (p - uStarP) / uStarS;
+    vec2 e = vec2(max(star2(q.xy) + uStarW.x, 0.0), q.z);
+    vec2 r = vec2(uStarW.x, uStarW.x * uStarW.y);
+    float k0 = length(e / r);
+    float k1 = max(length(e / (r * r)), 1e-6);
+    return k0 * (k0 - 1.0) / k1 * uStarS;
+}
+
+vec3 starNormal(vec3 p) {
+    // a wider tap smooths the ridges the way frosted glass does
+    float e = uStarS * (0.003 + uFrost * 0.0036);
+    vec2 k = vec2(1.0, -1.0);
+    return normalize(k.xyy * mapS(p + k.xyy * e) + k.yyx * mapS(p + k.yyx * e) +
+                     k.yxy * mapS(p + k.yxy * e) + k.xxx * mapS(p + k.xxx * e));
+}
+
+vec3 frostColor() {
+    return mix(vec3(0.84, 0.86, 0.92), uGlow, 0.12);
+}
+
+// March the star along a ray up to tMax: true on a hit (t set), and how close a miss came
+// (dmin) for the frosted halo. Bounded by the star's sphere and the slab the balloon lives in,
+// so most rays cross it in a short segment.
+bool marchStar(vec3 ro, vec3 rd, float tMax, out float t, out float dmin) {
+    dmin = 1e9;
+    t = 0.0;
+    vec3 oc = ro - uStarP;
+    float R = uStarS * 1.15 + uHalo;
+    float b = dot(oc, rd);
+    float h = b * b - dot(oc, oc) + R * R;
+    if (h <= 0.0) return false;
+    h = sqrt(h);
+    t = max(-b - h, 0.0);
+    float tEnd = min(-b + h, tMax);
+    float zs = uStarS * uStarW.x * uStarW.y + uHalo + 0.01;
+    float oz = (uStarM * oc).z, dz = (uStarM * rd).z;
+    if (abs(dz) > 1e-5) {
+        float ta = (-zs - oz) / dz, tb = (zs - oz) / dz;
+        t = max(t, min(ta, tb));
+        tEnd = min(tEnd, max(ta, tb));
+    } else if (abs(oz) > zs) return false;
+    for (int i = 0; i < 80; i++) {
+        if (t > tEnd) return false;
+        float d = mapS(ro + rd * t);
+        dmin = min(dmin, d);
+        if (d < 2.5e-4 * (1.0 + t)) return true;
+        t += d * 0.9;
+    }
+    return false;
+}
+
+// the frosted halo a near miss leaves, premultiplied
+vec4 halo(float dmin) {
+    float a = 1.0 - smoothstep(0.0, max(uHalo, 1e-5), dmin);
+    a *= a * (3.0 - 2.0 * a) * 0.9;
+    return vec4(frostColor() * a, a);
+}
+
+// The star's glass at a hit, premultiplied (thin parts let what is behind show through).
+vec4 shadeStar(vec3 ro, vec3 rd, float t) {
+    vec3 hp = ro + rd * t;
+    vec3 n = starNormal(hp);
+    float cosi = clamp(-dot(rd, n), 0.0, 1.0);
+    vec3 r1 = refract(rd, n, 1.0 / uIor);
+    // how much glass the bent ray crosses sets the colour: the balloon's thickness under the hit,
+    // read off its profile in one tap, stretched by how slantwise the ray runs through it
+    vec3 ql = uStarM * (hp - uStarP) / uStarS;
+    vec3 rl = uStarM * r1;
+    float ex = max(star2(ql.xy) + uStarW.x, 0.0) / uStarW.x;
+    float half_ = uStarW.x * uStarW.y * sqrt(max(1.0 - ex * ex, 0.0));
+    float L = min(2.0 * half_ / max(abs(rl.z), 0.35), 1.6);
+    float depth = 1.0 - exp(-L * uDensity);
+    // the far wall bends the ray again; where it heads for the key the glass lights up cyan,
+    // which draws the bright and dark channels running down the arms
+    vec3 ne = normalize(starNormal(hp + r1 * (L * uStarS)) + n * 0.35);
+    vec3 r2 = normalize(r1 + ne * (uIor - 1.0) * 1.6);
+    float toKey = smoothstep(-0.1, 0.9, dot(r2, KEY));
+    float lit = smoothstep(-0.1, 0.8, dot(n, KEY));
+    float v = clamp(depth * (1.0 - 0.35 * toKey) - 0.55 * lit, 0.0, 1.0);
+    // a darker star sits inside the clear blue shell, as in the reference: read where the bent
+    // ray passes it halfway through, so it slides against the shell as the star turns.
+    // It is the outer star at CORE_K scale, arms and all, its edge softened by Frost.
+    vec3 qm = ql + rl * (L * 0.5);
+    float coreW = 0.07 + uFrost * 0.012;
+    float core = 1.0 - smoothstep(-coreW, coreW, star2(qm.xy / CORE_K) * CORE_K);
+    v = max(v * 0.82, core * (0.95 - 0.4 * lit));
+    vec3 c = mix(uGlow, uBody, smoothstep(0.05, 0.5, v));
+    c = mix(c, uCore, smoothstep(0.42, 0.88, v));
+    // backlit glass: light scattered through the body leaks out at the rim away from the key
+    c += uGlow * (1.0 - cosi) * (1.0 - cosi) * (1.0 - lit) * 0.45;
+    float F = 0.04 + 0.96 * pow(1.0 - cosi, 5.0);
+    // frosted glass: the silhouette melts into the halo instead of ending on a hard line
+    c = mix(c, frostColor(), clamp(F * (0.3 + uFrost * 0.08) + (1.0 - smoothstep(0.0, 0.4, cosi)) * uFrost * 0.08, 0.0, 0.9));
+    // glossy skin: the studio in reflection plus broad, soft highlights (frosted glass blooms
+    // rather than glints)
+    vec3 V = -rd;
+    float g = pow(max(dot(n, normalize(KEY + V)), 0.0), 36.0) * 0.55 + pow(max(dot(n, normalize(TOP + V)), 0.0), 18.0) * 0.3;
+    vec3 spec = env(reflect(rd, n)) * F * uGloss + vec3(g * uGloss * (1.4 - uFrost * 0.06));
+    // thin glass is see-through: a ring or the page behind shows faintly through the arms
+    float a = mix(0.6, 1.0, smoothstep(0.15, 0.6, depth));
+    float sa = clamp(max(spec.r, max(spec.g, spec.b)), 0.0, 1.0);
+    return vec4(c * a + spec, a + (1.0 - a) * sa);
+}
+
+// Liquid glass tube, the parts that do not depend on what is behind it. Hollow, as in the
+// reference: straight through the middle the light crosses two thin walls and the studio shows
+// clear; just inside each edge it runs the length of a wall and darkens; at the very edge
+// Fresnel turns it into a mirror. On top: the tube lenses what is behind toward its axis with
+// R, G and B a hair apart, focuses the key into a thin bright caustic inside its far edge, and
+// throws crisp glints off its skin.
+struct Ring { vec3 hp; vec3 rb; vec3 envT; vec3 T; vec3 refl; float F; float add; };
+
+Ring ringAt(vec3 ro, vec3 rd, float t) {
+    Ring g = Ring(vec3(0.0), vec3(0.0, 0.0, -1.0), vec3(0.0), vec3(1.0), vec3(0.0), 0.0, 0.0);
+    g.hp = ro + rd * t;
+    int k = 0;
+    float best = 1e9;
+    for (int i = 0; i < 6; i++) {
+        if (i >= uRingN) break;
+        float d = abs(sdTor(uRingM[i] * g.hp, uRingR[i], uRingT[i]));
+        if (d < best) { best = d; k = i; }
+    }
+    mat3 M = uRingM[k];
+    vec3 q = M * g.hp;
+    vec3 C = vec3(normalize(q.xy + 1e-7) * uRingR[k], 0.0);
+    vec3 n = normalize(q - C) * M;
+    float cosi = clamp(-dot(rd, n), 0.0, 1.0);
+    g.F = 0.04 + 0.96 * pow(1.0 - cosi, 5.0);
+    // impact parameter across the tube: 0 on its axis, 1 at its edge
+    float u2 = clamp(1.0 - cosi * cosi, 0.0, 1.0);
+    float u = sqrt(u2);
+    float a = 1.0 - uWall;
+    float glass = 2.0 * (sqrt(1.0 - u2) - sqrt(max(a * a - u2, 0.0)));
+    float wallK = clamp(glass / (2.0 * sqrt(1.0 - a * a)), 0.0, 1.0);
+    g.T = mix(vec3(1.0), uTint, wallK) * (1.0 - 0.12 * wallK * wallK);
+    // the across-tube direction as seen down the ray (n with its along-ray part removed)
+    vec3 sp = n + rd * cosi;
+    vec3 sd = sp / max(length(sp), 1e-5);
+    float bend = (uIor - 1.0) * 0.45 * u2 * u;
+    g.rb = normalize(rd - sd * bend);
+    g.envT = vec3(env(normalize(rd - sd * bend * 0.8)).r, env(g.rb).g, env(normalize(rd - sd * bend * 1.2)).b);
+    g.refl = env(reflect(rd, n));
+    vec3 kp = KEY - rd * dot(KEY, rd);
+    float side = dot(sd, kp / max(length(kp), 1e-5));
+    float caustic = exp(-pow((u - 0.6) / 0.09, 2.0)) * smoothstep(0.1, 0.8, -side) * 0.3;
+    vec3 V = -rd;
+    g.add = caustic + pow(max(dot(n, normalize(KEY + V)), 0.0), 120.0) * 1.4 + pow(max(dot(n, normalize(TOP + V)), 0.0), 60.0) * 0.6;
+    return g;
+}
+
+// the tube over whatever lies behind it (st, premultiplied)
+vec4 ringOver(Ring g, vec4 st) {
+    vec4 solid = vec4(mix((st.rgb + g.envT * (1.0 - st.a)) * g.T, g.refl, g.F) + g.add, 1.0);
+    // over a see-through Background the page itself is what lies behind: leave it showing,
+    // darkened only by the walls, rather than painting the studio grey over it
+    float Tm = dot(g.T, vec3(0.3333));
+    vec4 clear = vec4(g.F * g.refl + (1.0 - g.F) * g.T * st.rgb + g.add,
+                      clamp(1.0 - (1.0 - g.F) * Tm * (1.0 - st.a) + g.add, 0.0, 1.0));
+    return mix(clear, solid, uBgA);
+}
+
+void main() {
+    vec2 p = (gl_FragCoord.xy - uCenter) / uFocal;
+    if (dot(p, p) > uQR * uQR) discard;
+    // Placement Angle rolls the lens; Tilt turns the rig about the camera's right axis
+    p = mat2(uRollCS.x, uRollCS.y, -uRollCS.y, uRollCS.x) * p;
+    vec3 ro = vec3(0.0, -uCamD * uTiltCS.y, uCamD * uTiltCS.x);
+    vec3 rd = normalize(vec3(p, -1.0));
+    rd = vec3(rd.x, uTiltCS.x * rd.y - uTiltCS.y * rd.z, uTiltCS.y * rd.y + uTiltCS.x * rd.z);
+    float b = dot(ro, rd);
+    if (b * b - dot(ro, ro) + uRB * uRB <= 0.0) discard;
+
+    // Each torus marched on its own, only over the stretch where the ray is inside both its
+    // tube-thick slab and its bounding sphere. A ray that misses keeps how close it came, as an
+    // angle at the lens: within a pixel of a tube it takes that share of the tube's colour,
+    // which anti-aliases every silhouette and costs nothing anywhere else.
+    float pix = 1.0 / uFocal;
+    float tr = 1e9, tc = 1e9, cov = 0.0;
+    for (int k = 0; k < 6; k++) {
+        if (k >= uRingN) break;
+        mat3 M = uRingM[k];
+        float R = uRingR[k], r = uRingT[k];
+        vec3 o = M * ro, d = M * rd;
+        float bs = dot(o, d);
+        float rr = R + r + pix * 3.0;
+        float hs = bs * bs - dot(o, o) + rr * rr;
+        if (hs <= 0.0) continue;
+        hs = sqrt(hs);
+        float ta = -bs - hs, tb = -bs + hs;
+        float zr = r + pix * 3.0;
+        if (abs(d.z) > 1e-5) {
+            float za = (-zr - o.z) / d.z, zb = (zr - o.z) / d.z;
+            ta = max(ta, min(za, zb));
+            tb = min(tb, max(za, zb));
+        } else if (abs(o.z) > zr) continue;
+        tb = min(tb, tr);
+        float t = max(ta, 0.0);
+        float ang = 1e9, tAng = 0.0;
+        bool hitK = false;
+        for (int i = 0; i < 48; i++) {
+            if (t > tb) break;
+            float dd = sdTor(o + d * t, R, r);
+            if (dd < 2.5e-4 * t) { tr = t; hitK = true; break; }
+            float an = dd / t;
+            if (an < ang) { ang = an; tAng = t; }
+            t += dd;
+        }
+        if (!hitK && ang < pix) {
+            float cv = 1.0 - ang / pix;
+            if (cv > cov) { cov = cv; tc = tAng; }
+        }
+    }
+    // the tube point this pixel shows: its hit, or the edge it just grazed in front of it
+    bool edge = cov > 0.0 && tc < tr;
+    bool ring = tr < 1e8 || edge;
+    float tR = edge ? tc : tr;
+    float rcov = tr < 1e8 ? 1.0 : cov;
+
+    // Is the star in front of the tube? If not, look for it through the tube instead. Either
+    // way it is shaded once, along whichever ray found it.
+    float ts, dmin;
+    bool front = marchStar(ro, rd, ring ? tR : 1e9, ts, dmin);
+    Ring g = Ring(vec3(0.0), vec3(0.0, 0.0, -1.0), vec3(0.0), vec3(1.0), vec3(0.0), 0.0, 0.0);
+    vec3 so = ro, sdir = rd;
+    float st0 = ts, dmin2 = 1e9;
+    bool behindHit = false;
+    if (ring) {
+        g = ringAt(ro, rd, tR);
+        if (!front) {
+            so = g.hp + g.rb * 1e-3;
+            sdir = g.rb;
+            behindHit = marchStar(so, sdir, 1e9, st0, dmin2);
+        }
+    }
+    vec4 S = front || behindHit ? shadeStar(so, sdir, st0) : vec4(0.0);
+    vec4 col;
+    if (front) {
+        col = S + (ring ? ringOver(g, vec4(0.0)) * rcov : vec4(0.0)) * (1.0 - S.a);
+    } else {
+        vec4 rc = ring ? ringOver(g, behindHit ? S : halo(dmin2)) * rcov : vec4(0.0);
+        vec4 hl = halo(dmin);
+        col = hl + rc * (1.0 - hl.a);
+    }
+    if (col.a < 0.002) discard;
+    outColor = vec4(clamp(col.rgb, 0.0, col.a), col.a);
+}`
+
+/** R = Rz(az)·Ry(ay)·Rx(ax), row-major into out[o..o+8]. Uploaded untransposed, GLSL reads it as Rᵀ (world → local). */
+function euler(out: Float32Array, o: number, ax: number, ay: number, az: number) {
+    const ca = Math.cos(ax), sa = Math.sin(ax)
+    const cb = Math.cos(ay), sb = Math.sin(ay)
+    const cc = Math.cos(az), sc = Math.sin(az)
+    const r00 = cb, r01 = sb * sa, r02 = sb * ca
+    const r11 = ca, r12 = -sa
+    out[o] = cc * r00
+    out[o + 1] = cc * r01 - sc * r11
+    out[o + 2] = cc * r02 - sc * r12
+    out[o + 3] = sc * r00
+    out[o + 4] = sc * r01 + cc * r11
+    out[o + 5] = sc * r02 + cc * r12
+    out[o + 6] = -sb
+    out[o + 7] = cb * sa
+    out[o + 8] = cb * ca
+}
+
+/** out[oo..] = a[ao..] · b[bo..], all row-major 3×3; out must not alias a or b. */
+function mul3(out: Float32Array, oo: number, a: Float32Array, ao: number, b: Float32Array, bo: number) {
+    for (let i = 0; i < 3; i++)
+        for (let j = 0; j < 3; j++)
+            out[oo + i * 3 + j] = a[ao + i * 3] * b[bo + j] + a[ao + i * 3 + 1] * b[bo + 3 + j] + a[ao + i * 3 + 2] * b[bo + 6 + j]
+}
+
+/** Arc centre for the sparkle's scooped sides, so the valley between arms sits at `waist` (star units). */
+function arcCentre(tip: number, waist: number) {
+    // valley(c) = c√2 − √((tip−c)² + c²) rises from 0 at c = tip/2 toward tip/√2
+    const target = Math.min(waist, tip * 0.7)
+    let lo = tip / 2, hi = tip * 40
+    for (let i = 0; i < 40; i++) {
+        const c = (lo + hi) / 2
+        const valley = c * Math.SQRT2 - Math.hypot(tip - c, c)
+        if (valley < target) lo = c
+        else hi = c
+    }
+    return (lo + hi) / 2
+}
+
+export default function SapphireArmillary(props: SapphireArmillaryProps) {
+    props = withMovedControls(props)
+    const {
+    background = DEFAULTS.background,
+    rings = DEFAULTS.rings,
+    scale = DEFAULTS.scale,
+    star,
+    ringTint = DEFAULTS.ringTint,
+    placement,
+    follow = DEFAULTS.follow,
+    response,
+    orbit = DEFAULTS.orbit,
+    speed = DEFAULTS.speed,
+    advanced,
+    style,
+} = props
+    const rootRef = useRef<HTMLDivElement>(null)
+    const canvasRef = useRef<HTMLCanvasElement>(null)
+    // Merged at render, so the frame loop reads plain values and allocates nothing.
+    const cfg = {
+        background, rings, scale, ringTint, follow, orbit, speed,
+        st: { ...DEFAULT_STAR, ...star },
+        pl: { ...DEFAULT_PLACEMENT, ...placement },
+        rs: { ...DEFAULT_RESPONSE, ...response },
+        adv: { ...DEFAULT_ADVANCED, ...advanced },
+    }
+    const cfgRef = useRef(cfg)
+    cfgRef.current = cfg
+    const wakeRef = useRef<() => void>(() => {})
+    // Bumped when the GPU drops the context, so the effect rebuilds everything.
+    const [generation, setGeneration] = useState(0)
+
+    // Every prop change redraws, even when the loop has settled to zero.
+    useEffect(() => wakeRef.current())
+
+    useEffect(() => {
+        const rootEl = rootRef.current
+        const canvasEl = canvasRef.current
+        if (!rootEl || !canvasEl) return
+        const ctx = canvasEl.getContext("webgl2", {
+            alpha: true,
+            premultipliedAlpha: true,
+            antialias: false,
+            depth: false,
+            powerPreference: "low-power",
+            preserveDrawingBuffer: false,
+        }) as WebGL2RenderingContext | null
+        // No WebGL2: the root's CSS Background stays showing.
+        if (!ctx) return
+        const root: HTMLDivElement = rootEl
+        const canvas: HTMLCanvasElement = canvasEl
+        const gl: WebGL2RenderingContext = ctx
+
+        let prog: WebGLProgram
+        const shaders: WebGLShader[] = []
+        try {
+            const compile = (type: number, src: string) => {
+                const sh = gl.createShader(type)!
+                gl.shaderSource(sh, src)
+                gl.compileShader(sh)
+                if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh) || "shader")
+                shaders.push(sh)
+                return sh
+            }
+            prog = gl.createProgram()!
+            gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT))
+            gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG))
+            gl.linkProgram(prog)
+            if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog) || "link")
+        } catch (err) {
+            console.error("SapphireArmillary:", err)
+            return
+        }
+        gl.useProgram(prog)
+        const vao = gl.createVertexArray()
+        gl.bindVertexArray(vao)
+        gl.clearColor(0, 0, 0, 0)
+
+        // Uniforms upload only when their value changed.
+        const slots = new Map<string, { loc: WebGLUniformLocation | null; v: number[] }>()
+        const slot = (name: string) => {
+            let s = slots.get(name)
+            if (!s) {
+                s = { loc: gl.getUniformLocation(prog, name), v: [NaN, NaN, NaN, NaN] }
+                slots.set(name, s)
+            }
+            return s
+        }
+        const u1 = (name: string, a: number) => {
+            const s = slot(name)
+            if (s.v[0] === a) return
+            s.v[0] = a
+            gl.uniform1f(s.loc, a)
+        }
+        const ui = (name: string, a: number) => {
+            const s = slot(name)
+            if (s.v[0] === a) return
+            s.v[0] = a
+            gl.uniform1i(s.loc, a)
+        }
+        const u2 = (name: string, a: number, b: number) => {
+            const s = slot(name)
+            if (s.v[0] === a && s.v[1] === b) return
+            s.v[0] = a
+            s.v[1] = b
+            gl.uniform2f(s.loc, a, b)
+        }
+        const u3 = (name: string, a: number, b: number, c: number) => {
+            const s = slot(name)
+            if (s.v[0] === a && s.v[1] === b && s.v[2] === c) return
+            s.v[0] = a
+            s.v[1] = b
+            s.v[2] = c
+            gl.uniform3f(s.loc, a, b, c)
+        }
+        const u4 = (name: string, a: number, b: number, c: number, d: number) => {
+            const s = slot(name)
+            if (s.v[0] === a && s.v[1] === b && s.v[2] === c && s.v[3] === d) return
+            s.v[0] = a
+            s.v[1] = b
+            s.v[2] = c
+            s.v[3] = d
+            gl.uniform4f(s.loc, a, b, c, d)
+        }
+        const uc = (name: string, c: RGBA) => u3(name, c[0], c[1], c[2])
+        const ringLoc = gl.getUniformLocation(prog, "uRingM")
+        const starLoc = gl.getUniformLocation(prog, "uStarM")
+        const ringRLoc = gl.getUniformLocation(prog, "uRingR")
+        const ringTLoc = gl.getUniformLocation(prog, "uRingT")
+        const ringBuf = new Float32Array(9 * MAX_RINGS)
+        const ringRBuf = new Float32Array(MAX_RINGS)
+        const ringTBuf = new Float32Array(MAX_RINGS)
+        const starBuf = new Float32Array(9)
+        const tmpA = new Float32Array(9)
+        const tmpB = new Float32Array(9)
+
+        // Layout size from ResizeObserver only; never read per frame.
+        let cssW = Math.max(1, root.offsetWidth)
+        let cssH = Math.max(1, root.offsetHeight)
+        let quality = 1
+        let pxScale = 1
+        // on-screen size over layout size: Framer's canvas zoom enlarges the box without resizing it
+        let viewScale = 1
+        const applySize = () => {
+            // Up to 2 device px per CSS px; a 1× screen still renders at 1.5× so the thin tubes
+            // come out smooth after the browser's downsample, and a zoomed-in canvas gets the
+            // pixels it is shown at, still capped at 2.
+            const dprRaw = window.devicePixelRatio || 1
+            const dpr = Math.min(2, Math.max(1.5, dprRaw * 1.25, dprRaw * viewScale))
+            const c = cfgRef.current
+            const ringCss = 0.3455 * Math.min(cssW, cssH) * (clampN(c.scale, 25, 135, DEFAULTS.scale) / 100)
+            // Budget what the march actually covers: the rig's circle, not the whole frame.
+            const quadCss = ringCss * 1.35
+            const covered = Math.PI * quadCss * quadCss * dpr * dpr
+            const budget = Math.min(1, Math.sqrt(PIXEL_BUDGET / Math.max(1, covered)))
+            pxScale = dpr * budget * quality
+            const w = Math.max(1, Math.round(cssW * pxScale))
+            const h = Math.max(1, Math.round(cssH * pxScale))
+            if (canvas.width !== w) canvas.width = w
+            if (canvas.height !== h) canvas.height = h
+        }
+        viewScale = root.getBoundingClientRect().width / cssW || 1
+        applySize()
+        let lastScale = cfgRef.current.scale
+        const ro = new ResizeObserver((entries) => {
+            const r = entries[0].contentRect
+            cssW = Math.max(1, r.width)
+            cssH = Math.max(1, r.height)
+            applySize()
+            wake()
+        })
+        ro.observe(root)
+
+        // Pointer: handlers only record; the rect is read once per frame, only after a move or scroll.
+        const ptr = { cx: 0, cy: 0, u: 0.5, v: 0.5, over: false, moved: false }
+        const onMove = (e: PointerEvent) => {
+            ptr.cx = e.clientX
+            ptr.cy = e.clientY
+            ptr.over = true
+            ptr.moved = true
+            wake()
+        }
+        const onLeave = () => {
+            ptr.over = false
+            wake()
+        }
+        const onUp = (e: PointerEvent) => {
+            // On touch, lifting the finger ends the hover.
+            if (e.pointerType !== "mouse") onLeave()
+        }
+        const onScroll = () => {
+            if (ptr.over) ptr.moved = true
+        }
+        root.addEventListener("pointerenter", onMove)
+        root.addEventListener("pointermove", onMove)
+        root.addEventListener("pointerdown", onMove)
+        root.addEventListener("pointerleave", onLeave)
+        root.addEventListener("pointerup", onUp)
+        root.addEventListener("pointercancel", onLeave)
+        window.addEventListener("scroll", onScroll, { passive: true, capture: true })
+
+        const mq = typeof window.matchMedia === "function" ? window.matchMedia("(prefers-reduced-motion: reduce)") : null
+        let reduced = !!mq?.matches
+        const onMq = () => {
+            reduced = !!mq?.matches
+            wake()
+        }
+        mq?.addEventListener?.("change", onMq)
+
+        // Off-screen instances and hidden tabs stop drawing entirely.
+        let visible = true
+        const io = new IntersectionObserver((es) => {
+            visible = es[es.length - 1].isIntersecting
+            wake()
+        })
+        io.observe(root)
+        const onVis = () => wake()
+        document.addEventListener("visibilitychange", onVis)
+
+        let disposed = false
+        let raf = 0
+        const onLost = (e: Event) => {
+            e.preventDefault()
+            disposed = true
+            cancelAnimationFrame(raf)
+        }
+        const onRestored = () => setGeneration((g) => g + 1)
+        canvas.addEventListener("webglcontextlost", onLost)
+        canvas.addEventListener("webglcontextrestored", onRestored)
+
+        // Springs: star look (yaw, pitch), drift (x, y), ring lean (x, y). x = value, v = velocity.
+        const N_SPR = 6
+        const sx = new Float64Array(N_SPR)
+        const sv = new Float64Array(N_SPR)
+        const tg = new Float64Array(N_SPR)
+        let clock = 0
+        let acc = 0
+        let lastDraw = -1
+        let frameEma = 16.7
+        // the display's own frame interval: Framer's canvas and power-saving browsers tick at
+        // 30 Hz, which is not a slow GPU and must not cost resolution
+        let cadence = 16.7
+        let slowFrames = 0
+        let fastFrames = 0
+        let scheduled = false
+
+        function wake() {
+            if (disposed || scheduled) return
+            scheduled = true
+            raf = requestAnimationFrame(loop)
+        }
+        wakeRef.current = wake
+
+        function loop(now: number) {
+            scheduled = false
+            if (disposed || !visible || document.hidden) {
+                lastDraw = -1
+                return
+            }
+            const c = cfgRef.current
+            const adv = c.adv
+            const rs = c.rs
+            if (c.scale !== lastScale) {
+                lastScale = c.scale
+                applySize()
+            }
+            const spd = clampN(c.speed, 0, 10, DEFAULTS.speed)
+            const rate = reduced ? 0 : spd / 5
+            const spin = c.orbit === "spin"
+
+            // ── pointer → a point on the rig's mid-plane, through the same lens the shader uses ──
+            if (ptr.moved) {
+                ptr.moved = false
+                // Normalised against the box as displayed, so canvas zoom and scaled previews stay exact.
+                const r = root.getBoundingClientRect()
+                ptr.u = (ptr.cx - r.left) / Math.max(1, r.width)
+                ptr.v = (ptr.cy - r.top) / Math.max(1, r.height)
+                const vs = r.width / cssW
+                if (Math.abs(vs - viewScale) > 0.1) {
+                    viewScale = vs
+                    applySize()
+                }
+            }
+            const camD = clampN(adv.lens, 1.8, 8, DEFAULT_ADVANCED.lens)
+            const ringCss = 0.3455 * Math.min(cssW, cssH) * (clampN(c.scale, 25, 135, DEFAULTS.scale) / 100)
+            const focalCss = ringCss * camD
+            const pl = c.pl
+            const ang = clampN(pl.angle, -180, 180, 0) * D2R
+            const tilt = clampN(pl.tilt, -90, 90, 0) * D2R
+            const ox = (clampN(pl.x, -50, 50, 0) / 100) * cssW
+            const oy = (clampN(pl.y, -50, 50, 0) / 100) * cssH
+            let px = 0, py = 0
+            const on = c.follow !== false && ptr.over
+            if (on) {
+                // screen (y up) → lens → undo roll → ray, tilted into rig space → hit z = 0
+                const qx = (ptr.u * cssW - (cssW / 2 + ox)) / focalCss
+                const qy = -(ptr.v * cssH - (cssH / 2 + oy)) / focalCss
+                const ca = Math.cos(ang), sa = Math.sin(ang)
+                const rx = ca * qx - sa * qy, ry = sa * qx + ca * qy
+                const ct = Math.cos(tilt), st = Math.sin(tilt)
+                const oyR = -camD * st, ozR = camD * ct
+                const dyR = ct * ry + st, dzR = st * ry - ct
+                const t = Math.abs(dzR) > 1e-4 ? -ozR / dzR : 0
+                px = rx * Math.max(0, t)
+                py = oyR + dyR * Math.max(0, t)
+            }
+            // Look 10 turns the star up to 60°; tanh eases it in so a corner never shows it side-on
+            const lookMax = clampN(rs.look, 0, 10, DEFAULT_RESPONSE.look) * 6 * D2R * (reduced ? 0.5 : 1)
+            const drift = clampN(rs.drift, 0, 10, DEFAULT_RESPONSE.drift) / 10
+            const par = (clampN(rs.parallax, 0, 10, DEFAULT_RESPONSE.parallax) / 10) * (reduced ? 0.5 : 1)
+            // the star's front turns toward the cursor
+            tg[0] = on ? lookMax * Math.tanh(px * 0.7) : 0
+            tg[1] = on ? -lookMax * Math.tanh(py * 0.7) : 0
+            // drift: a share of the way toward the cursor, held inside the rings
+            const dl = Math.hypot(px, py)
+            const dk = dl > 1e-6 ? (Math.min(dl, 1.2) / dl) * 0.16 * drift : 0
+            tg[2] = on ? px * dk : 0
+            tg[3] = on ? py * dk : 0
+            // rings lean the other way, a few degrees
+            tg[4] = on ? -py * 0.14 * par : 0
+            tg[5] = on ? px * 0.14 * par : 0
+
+            let springsLive = false
+            for (let i = 0; i < N_SPR; i++) if (Math.abs(sx[i] - tg[i]) > 1e-4 || Math.abs(sv[i]) > 1e-3) springsLive = true
+            const idle = rate > 0
+            // 60 fps while anything moves (only a near-still sway drops to 30); 0 once at rest.
+            const gap = springsLive || (idle && (spin || spd > 1.5)) ? 15 : 31
+            if (lastDraw >= 0 && now - lastDraw < gap) {
+                wake()
+                return
+            }
+            const dt = lastDraw < 0 ? 0 : Math.min((now - lastDraw) / 1000, 1 / 15)
+            if (lastDraw >= 0) {
+                const iv = now - lastDraw
+                cadence = iv < cadence ? iv : cadence + (iv - cadence) * 0.01
+                frameEma += (iv - frameEma) * 0.1
+                // Step resolution down when frames run long; win it back when there is room again.
+                const target = Math.max(gap + 2, cadence * 1.05)
+                if (frameEma > target * 1.45) slowFrames++
+                else slowFrames = 0
+                if (frameEma < target * 1.1) fastFrames++
+                else fastFrames = 0
+                if (slowFrames > 20 && quality > 0.6) {
+                    quality = Math.max(0.6, quality * 0.88)
+                    slowFrames = 0
+                    applySize()
+                } else if (fastFrames > 180 && quality < 1) {
+                    quality = Math.min(1, quality * 1.08)
+                    fastFrames = 0
+                    applySize()
+                }
+            }
+            lastDraw = now
+
+            // fixed-substep springs
+            const settle = clampN(adv.followMs, 80, 2000, DEFAULT_ADVANCED.followMs) / 1000
+            const w = 4 / (ZETA * settle)
+            const kS = w * w, kD = 2 * ZETA * w
+            acc += dt
+            while (acc >= STEP) {
+                acc -= STEP
+                for (let i = 0; i < N_SPR; i++) {
+                    sv[i] += (kS * (tg[i] - sx[i]) - kD * sv[i]) * STEP
+                    sx[i] += sv[i] * STEP
+                }
+            }
+            if (!springsLive) for (let i = 0; i < N_SPR; i++) { sx[i] = tg[i]; sv[i] = 0 }
+            clock = (clock + dt * rate) % 3600
+
+            // ── rings: the reference pose, then the sway or spin, then the lean ──
+            // One clock drives all three. Spin: constant rates in a fixed 4 : 3 : 2 ratio, counter-
+            // rotating like a gyroscope, so nothing speeds up or stalls. Sway: one shared sine,
+            // each ring a fixed share of it, so they rock together rather than at random.
+            const swing = clampN(adv.swing, 0, 90, DEFAULT_ADVANCED.swing) * D2R
+            const ta = clock * SPIN_RATE
+            const sw = Math.sin(clock * SWAY_RATE) * swing
+            const ringCount = Math.round(clampN(c.rings, 0, MAX_RINGS, DEFAULTS.rings))
+            const radiusM = clampN(adv.middleRadius, 30, 100, DEFAULT_ADVANCED.middleRadius) / 100
+            const radiusI = clampN(adv.innerRadius, 30, 100, DEFAULT_ADVANCED.innerRadius) / 100
+            const radiusRatio = radiusM > 1e-4 ? Math.max(0.3, Math.min(0.98, radiusI / radiusM)) : 0.85
+            const ringTubeO = clampN(adv.outerTube, 1, 12, DEFAULT_ADVANCED.outerTube) / 100
+            const ringTubeM = clampN(adv.middleTube, 1, 12, DEFAULT_ADVANCED.middleTube) / 100
+            const ringTubeI = clampN(adv.innerTube, 1, 12, DEFAULT_ADVANCED.innerTube) / 100
+            const tubeRatio = ringTubeM > 1e-5 ? Math.max(0.3, Math.min(1.3, ringTubeI / ringTubeM)) : 1
+            const leanM = clampN(adv.middleLean, 0, 90, DEFAULT_ADVANCED.middleLean) * D2R
+            const turnI = clampN(adv.innerTurn, 0, 90, DEFAULT_ADVANCED.innerTurn) * D2R
+            // Outer/middle/inner anchor the series (their own named dials); any ring past the
+            // third keeps nesting inward at the same radius and tube ratio as middle→inner, its
+            // lean/turn baseline decaying the same way, so "more rings" reads as a continuation
+            // of the reference's three rather than new, unrelated ones.
+            ringRBuf[0] = 1; ringRBuf[1] = radiusM; ringRBuf[2] = radiusI
+            ringTBuf[0] = ringTubeO; ringTBuf[1] = ringTubeM; ringTBuf[2] = ringTubeI
+            const baseline = [OUTER_YAW * D2R, leanM, turnI]
+            // Past the third named ring there is no more room toward the centre — the star sits
+            // there — so further rings stack outward instead, continuing the middle→inner step
+            // in reverse (radius grows outward, tube keeps the same trend), never shrinking onto
+            // the star the way nesting further in used to.
+            const growR = radiusRatio > 1e-4 ? 1 / radiusRatio : 1
+            for (let i = 3; i < MAX_RINGS; i++) {
+                ringRBuf[i] = Math.min(2.4, ringRBuf[i - 1] * growR)
+                ringTBuf[i] = Math.max(0.008, ringTBuf[i - 1] * tubeRatio)
+                baseline.push(baseline[i - 2] * 0.78)
+            }
+            euler(tmpA, 0, sx[4], sx[5], 0)
+            for (let i = 0; i < ringCount; i++) {
+                // 4 : 3 : 2 outer : middle : inner continues outward in the same steps, sign
+                // alternating so neighbours counter-rotate like a gyroscope; even rings turn in
+                // yaw (as the outer and inner rings do), odd ones lean in pitch (as the middle does).
+                const sign = i % 2 === 0 ? 1 : -1
+                const a = spin ? 0.25 * (i + 2) * ta * sign : (0.4 + 0.3 * i) * sw * sign
+                if (i % 2 === 0) euler(tmpB, 0, 0, baseline[i] + a, 0)
+                else euler(tmpB, 0, baseline[i] + a, 0, 0)
+                mul3(ringBuf, i * 9, tmpA, 0, tmpB, 0)
+            }
+
+            // ── star: rest pose with a slow float, then the look on top ──
+            const bob = clampN(adv.bob, 0, 10, DEFAULT_ADVANCED.bob) / 100
+            euler(
+                tmpB, 0,
+                // the float traces one slow circle: pitch and yaw a quarter-turn apart, roll with the bob
+                clampN(adv.restPitch, -60, 60, DEFAULT_ADVANCED.restPitch) * D2R + Math.sin(clock * FLOAT_RATE) * 0.05,
+                clampN(adv.restYaw, -60, 60, DEFAULT_ADVANCED.restYaw) * D2R + (Math.cos(clock * FLOAT_RATE) - 1) * 0.08,
+                clampN(adv.restRoll, -45, 45, DEFAULT_ADVANCED.restRoll) * D2R + Math.sin(clock * FLOAT_RATE * 2) * 0.03
+            )
+            euler(tmpA, 0, sx[1], sx[0], 0)
+            mul3(starBuf, 0, tmpA, 0, tmpB, 0)
+
+            let ringExtent = 0
+            for (let i = 0; i < ringCount; i++) ringExtent = Math.max(ringExtent, ringRBuf[i] + ringTBuf[i])
+            const rB = Math.max(1, ringExtent) + RIG_PAD
+            const starS = clampN(adv.starSize, 20, 90, DEFAULT_ADVANCED.starSize) / 100
+            const frost = clampN(c.st.frost, 0, 10, DEFAULT_STAR.frost)
+            const tipRound = 0.2
+            const tip = 1 - tipRound
+            const waistU = clampN(adv.waist, 25, 70, DEFAULT_ADVANCED.waist) / 100
+            const arcC = arcCentre(tip, Math.max(0.02, waistU - tipRound))
+            // balloon section: Bulge sets how far in from the rim the ellipse reaches (W); ZS then
+            // makes the centre, which sits Waist in from the rim, exactly Puff thick
+            const inflate = 0.14 + 0.56 * (clampN(adv.dome, 0, 100, DEFAULT_ADVANCED.dome) / 100)
+            const e0 = Math.max(inflate - waistU, 0) / inflate
+            const zs = (clampN(adv.puff, 5, 60, DEFAULT_ADVANCED.puff) / 100) / (inflate * Math.sqrt(1 - e0 * e0))
+
+            const W = canvas.width, H = canvas.height
+            const k = W / cssW
+            const focal = focalCss * k
+            const cx = (cssW / 2 + ox) * k
+            const cy = (cssH / 2 - oy) * k
+            // the bounding sphere's silhouette: a circle of this radius in focal units
+            const qr = rB / Math.sqrt(Math.max(1e-3, camD * camD - rB * rB))
+
+            gl.viewport(0, 0, W, H)
+            gl.clear(gl.COLOR_BUFFER_BIT)
+            u2("uRes", W, H)
+            u2("uCenter", cx, cy)
+            u1("uQuad", qr * focal + 2)
+            u1("uFocal", focal)
+            u1("uQR", qr)
+            u1("uCamD", camD)
+            u1("uRB", rB)
+            u2("uRollCS", Math.cos(ang), Math.sin(ang))
+            u2("uTiltCS", Math.cos(tilt), Math.sin(tilt))
+            gl.uniformMatrix3fv(ringLoc, false, ringBuf)
+            gl.uniformMatrix3fv(starLoc, false, starBuf)
+            gl.uniform1fv(ringRLoc, ringRBuf)
+            gl.uniform1fv(ringTLoc, ringTBuf)
+            ui("uRingN", ringCount)
+            u3("uStarP", sx[2], sx[3] + Math.sin(clock * FLOAT_RATE * 2) * bob, 0)
+            u1("uStarS", starS)
+            u4("uStarK", tip, arcC, Math.hypot(tip - arcC, arcC), tipRound)
+            u2("uStarW", inflate, zs)
+            uc("uGlow", parseColor(c.st.glow, [0.071, 0.706, 0.761, 1]))
+            uc("uBody", parseColor(c.st.body, [0.043, 0.18, 0.604, 1]))
+            uc("uCore", parseColor(c.st.core, [0.024, 0.067, 0.31, 1]))
+            uc("uTint", parseColor(c.ringTint, [0.867, 0.89, 0.91, 1]))
+            // a see-through Background still gives the glass the reference's grey studio to show
+            const bg = parseColor(c.background, [0.698, 0.698, 0.698, 1])
+            if (bg[3] > 0.01) uc("uEnv", bg)
+            else u3("uEnv", 0.698, 0.698, 0.698)
+            u1("uBgA", bg[3])
+            u1("uFrost", frost)
+            u1("uHalo", frost * 0.02 * starS)
+            u1("uIor", clampN(adv.ior, 1, 2.4, DEFAULT_ADVANCED.ior))
+            u1("uDensity", clampN(adv.depth, 0.2, 10, DEFAULT_ADVANCED.depth))
+            u1("uWall", clampN(adv.wall, 5, 100, DEFAULT_ADVANCED.wall) / 100)
+            u1("uGloss", clampN(adv.gloss, 0, 100, DEFAULT_ADVANCED.gloss) / 100)
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
+
+            if (idle || springsLive) wake()
+        }
+        wake()
+
+        return () => {
+            disposed = true
+            wakeRef.current = () => {}
+            cancelAnimationFrame(raf)
+            ro.disconnect()
+            io.disconnect()
+            root.removeEventListener("pointerenter", onMove)
+            root.removeEventListener("pointermove", onMove)
+            root.removeEventListener("pointerdown", onMove)
+            root.removeEventListener("pointerleave", onLeave)
+            root.removeEventListener("pointerup", onUp)
+            root.removeEventListener("pointercancel", onLeave)
+            window.removeEventListener("scroll", onScroll, { capture: true })
+            document.removeEventListener("visibilitychange", onVis)
+            mq?.removeEventListener?.("change", onMq)
+            canvas.removeEventListener("webglcontextlost", onLost)
+            canvas.removeEventListener("webglcontextrestored", onRestored)
+            if (gl.isContextLost()) return
+            gl.deleteVertexArray(vao)
+            shaders.forEach((s) => gl.deleteShader(s))
+            gl.deleteProgram(prog)
+        }
+    }, [generation])
+
+    return (
+        <div
+            ref={rootRef}
+            style={{ position: "relative", width: "100%", height: "100%", ...style, overflow: "hidden", background, touchAction: "pan-y" }}
+        >
+            <canvas
+                ref={canvasRef}
+                style={{ position: "absolute", inset: 0, width: "100%", height: "100%", display: "block" }}
+            />
+        </div>
+    )
+}
+
+addPropertyControls(SapphireArmillary, {
+    background: {
+        type: ControlType.Color,
+        title: "Background",
+        defaultValue: DEFAULTS.background,
+        description: "The studio ground; the glass rings show it through them.",
+    },
+    star: {
+        type: ControlType.Object,
+        title: "Star",
+        controls: {
+            glow: { type: ControlType.Color, title: "Glow", defaultValue: "#D92424", description: "Thin glass: the arm edges and the side facing the light." },
+            body: { type: ControlType.Color, title: "Body", defaultValue: "#D14141", description: "Most of the star." },
+            core: { type: ControlType.Color, title: "Core", defaultValue: "#951616", description: "The thickest glass, deep in the middle." },
+            frost: { type: ControlType.Number, title: "Frost", min: 0, max: 10, step: 0.1, defaultValue: 5, description: "Soft frosted halo at the edge and a smoother body; 0 is clear, crisp glass." },
+        },
+    },
+    rings: {
+        type: ControlType.Number,
+        title: "Rings",
+        min: 0,
+        max: 6,
+        step: 1,
+        displayStepper: true,
+        defaultValue: DEFAULTS.rings,
+        description: "3 is outer, middle and inner; more nest further inward, each thinner than the last; 0 leaves the star alone.",
+    },
+    scale: {
+        type: ControlType.Number,
+        title: "Scale",
+        min: 25,
+        max: 135,
+        step: 1,
+        unit: "%",
+        defaultValue: DEFAULTS.scale,
+        description: "How big the rig draws; 100% is the reference framing.",
+    },
+    placement: {
+        type: ControlType.Object,
+        title: "Placement",
+        controls: {
+            x: { type: ControlType.Number, title: "X Offset", unit: "%", min: -50, max: 50, step: 0.5, defaultValue: 0, description: "Moves the rig across the frame. Positive is right." },
+            y: { type: ControlType.Number, title: "Y Offset", unit: "%", min: -50, max: 50, step: 0.5, defaultValue: 0, description: "Moves the rig down the frame. Positive is down." },
+            angle: { type: ControlType.Number, title: "Angle", unit: "°", min: -180, max: 180, step: 1, defaultValue: 0, description: "Turns the rig in the picture plane. Positive is clockwise." },
+            tilt: { type: ControlType.Number, title: "Tilt", unit: "°", min: -90, max: 90, step: 1, defaultValue: 0, description: "Leans the rig about the frame's horizontal axis. Positive tips its top away." },
+        },
+    },
+    follow: {
+        type: ControlType.Boolean,
+        title: "Follow",
+        defaultValue: DEFAULTS.follow,
+        enabledTitle: "On",
+        disabledTitle: "Off",
+        description: "The star looks at the cursor and drifts toward it.",
+    },
+    response: {
+        type: ControlType.Object,
+        title: "Response",
+        hidden: (p: SapphireArmillaryProps) => p.follow === false,
+        controls: {
+            look: { type: ControlType.Number, title: "Look", min: 0, max: 10, step: 0.1, defaultValue: 10, description: "How far the star turns to face the cursor; 10 is up to 60°." },
+            drift: { type: ControlType.Number, title: "Drift", min: 0, max: 10, step: 0.1, defaultValue: 5.4, description: "How far the star moves toward the cursor, kept inside the rings." },
+            parallax: { type: ControlType.Number, title: "Parallax", min: 0, max: 10, step: 0.1, defaultValue: 10, description: "How far the rings lean away from the cursor." },
+        },
+    },
+    orbit: {
+        type: ControlType.Enum,
+        title: "Orbit",
+        options: ["sway", "spin"],
+        optionTitles: ["Sway", "Spin"],
+        displaySegmentedControl: true,
+        defaultValue: DEFAULTS.orbit,
+        description: "Sway rocks the rings about the reference pose; Spin turns them right round like a gyroscope.",
+    },
+    speed: {
+        type: ControlType.Number,
+        title: "Speed",
+        min: 0,
+        max: 10,
+        step: 0.1,
+        defaultValue: DEFAULTS.speed,
+        description: "Rate of the rings' motion and the star's float; 0 holds the pose.",
+    },
+    advanced: {
+        type: ControlType.Object,
+        title: "Advanced",
+        controls: {
+            waist: { type: ControlType.Number, title: "Star Waist", unit: "%", min: 25, max: 70, step: 1, defaultValue: 70, description: "Depth of the valleys between arms, as a share of the arm; low is a thin sparkle, high a fat cross." },
+            puff: { type: ControlType.Number, title: "Star Puff", unit: "%", min: 5, max: 60, step: 1, defaultValue: 45, description: "Half-thickness at the star's centre, as a share of an arm." },
+            dome: { type: ControlType.Number, title: "Star Bulge", unit: "%", min: 0, max: 100, step: 1, defaultValue: 78, description: "How round the star swells: 0 is a flat pillow with beaded edges, 100 a full balloon." },
+            starSize: { type: ControlType.Number, title: "Star Size", unit: "%", min: 20, max: 90, step: 1, defaultValue: 56, description: "Arm length as a share of the outer ring's radius." },
+            middleRadius: { type: ControlType.Number, title: "Middle Ring", unit: "%", min: 30, max: 100, step: 1, defaultValue: 100, description: "Middle ring's radius against the outer ring." },
+            innerRadius: { type: ControlType.Number, title: "Inner Ring", unit: "%", min: 30, max: 100, step: 1, defaultValue: 78, description: "Inner ring's radius against the outer ring." },
+            outerTube: { type: ControlType.Number, title: "Outer Tube", unit: "%", min: 1, max: 12, step: 0.1, defaultValue: 5.2, description: "Outer ring's tube radius, as a share of its radius." },
+            middleTube: { type: ControlType.Number, title: "Middle Tube", unit: "%", min: 1, max: 12, step: 0.1, defaultValue: 4, description: "Middle ring's tube radius, as a share of the outer ring." },
+            innerTube: { type: ControlType.Number, title: "Inner Tube", unit: "%", min: 1, max: 12, step: 0.1, defaultValue: 5.2, description: "Inner ring's tube radius, as a share of the outer ring." },
+            middleLean: { type: ControlType.Number, title: "Middle Lean", unit: "°", min: 0, max: 90, step: 1, defaultValue: 65, description: "Middle ring's rest lean back from face-on; its top arc comes toward you." },
+            innerTurn: { type: ControlType.Number, title: "Inner Turn", unit: "°", min: 0, max: 90, step: 1, defaultValue: 64, description: "Inner ring's rest turn from face-on about the vertical; its left arc comes toward you." },
+            lens: { type: ControlType.Number, title: "Camera Distance", min: 1.8, max: 8, step: 0.1, defaultValue: 4.1, description: "In outer-ring radii. Close is the reference's strong perspective; far flattens it." },
+            restYaw: { type: ControlType.Number, title: "Star Yaw", unit: "°", min: -60, max: 60, step: 1, defaultValue: 3, description: "Star's resting turn about the vertical. Negative shows its right side." },
+            restPitch: { type: ControlType.Number, title: "Star Pitch", unit: "°", min: -60, max: 60, step: 1, defaultValue: 8, description: "Star's resting lean. Positive tips its top toward you." },
+            restRoll: { type: ControlType.Number, title: "Star Roll", unit: "°", min: -45, max: 45, step: 1, defaultValue: 2, description: "Star's resting turn in the picture plane. Positive is counter-clockwise." },
+            wall: { type: ControlType.Number, title: "Ring Wall", unit: "%", min: 5, max: 100, step: 1, defaultValue: 30, description: "Glass wall of the hollow ring tubes, as a share of the tube; 100% is a solid rod." },
+            ior: { type: ControlType.Number, title: "IOR", min: 1, max: 2.4, step: 0.01, defaultValue: 1.45, description: "Index of refraction for all the glass: how hard it bends what is behind." },
+            depth: { type: ControlType.Number, title: "Absorption", min: 0.2, max: 10, step: 0.1, defaultValue: 4.1, description: "How quickly the star darkens from Glow to Core with thickness." },
+            gloss: { type: ControlType.Number, title: "Gloss", unit: "%", min: 0, max: 100, step: 1, defaultValue: 39, description: "Studio reflections on the star." },
+            swing: { type: ControlType.Number, title: "Sway", unit: "°", min: 0, max: 90, step: 1, defaultValue: 17, description: "How far the rings rock in Sway mode." },
+            bob: { type: ControlType.Number, title: "Float", unit: "%", min: 0, max: 10, step: 0.1, defaultValue: 3, description: "Height of the star's slow bob, as a share of the outer ring." },
+            followMs: { type: ControlType.Number, title: "Follow Time", unit: "ms", min: 80, max: 2000, step: 10, defaultValue: 380, description: "How long the star takes to settle on the cursor." },
+            ringTint: {
+                type: ControlType.Color,
+                title: "Ring Tint",
+                defaultValue: "#DDE3E8",
+                description: "Colour the rings take on where light crosses the most glass.",
+            },
+        },
+    },
+})
