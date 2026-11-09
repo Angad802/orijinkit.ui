@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plumb Navbar</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#050506;font-family:Inter,system-ui,-apple-system,sans-serif;min-height:100vh;color:#fff}
+
+  .header{position:sticky;top:0;padding:14px 16px;z-index:50}
+  .nav{
+    max-width:1160px;margin:0 auto;min-height:72px;padding:0 12px 0 28px;
+    display:flex;align-items:center;justify-content:space-between;gap:20px;
+    border-radius:24px;
+    background:linear-gradient(180deg,rgba(24,26,30,.92),rgba(10,11,13,.92));
+    border:1px solid rgba(255,255,255,.1);
+    box-shadow:0 10px 40px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.07);
+    backdrop-filter:blur(16px);
+  }
+
+  /* Logo */
+  .brand{display:flex;align-items:center;gap:14px;text-decoration:none;color:#fff;font-weight:700;font-size:1.2rem;letter-spacing:-.01em}
+  .brand svg{width:22px;height:30px}
+
+  /* Links */
+  .links{display:flex;align-items:center;gap:36px;list-style:none}
+  .links a{position:relative;text-decoration:none;color:#9a9ca3;font-size:16px;font-weight:500;white-space:nowrap;transition:color .2s}
+  .links a:hover,.links a.active{color:#fff}
+  .links a.active::after{
+    content:"";position:absolute;left:50%;bottom:-14px;width:22px;height:2px;transform:translateX(-50%);
+    border-radius:2px;background:#cfe3ff;
+    box-shadow:0 0 14px 4px rgba(150,190,255,.55),0 0 40px 10px rgba(120,160,255,.25);
+  }
+
+  /* Right side */
+  .cta-wrap{display:flex;align-items:center;gap:22px}
+  .signin{text-decoration:none;color:#9a9ca3;font-size:16px;font-weight:500;transition:color .2s}
+  .signin:hover{color:#fff}
+  .cta{
+    display:inline-flex;align-items:center;gap:14px;min-height:52px;padding:0 8px 0 22px;
+    border-radius:999px;color:#fff;text-decoration:none;font-weight:600;font-size:16px;white-space:nowrap;
+    background:linear-gradient(180deg,#1c1d21,#0c0d0f);
+    border:1px solid rgba(255,255,255,.12);box-shadow:inset 0 1px 0 rgba(255,255,255,.08);
+    transition:background .2s;
+  }
+  .cta:hover{background:linear-gradient(180deg,#25262b,#111214)}
+  .cta-arrow{
+    display:grid;place-items:center;width:38px;height:38px;border-radius:50%;
+    background:radial-gradient(circle at 35% 30%,#8f8cff,#5648e8 70%);
+    box-shadow:0 0 18px rgba(99,86,255,.55);transition:transform .2s;
+  }
+  .cta:hover .cta-arrow{transform:translateX(2px)}
+
+  /* Mobile */
+  .menu-btn{display:none;background:none;color:#fff;border:1px solid rgba(255,255,255,.25);border-radius:999px;min-height:44px;padding:0 16px;font:inherit;font-weight:600;cursor:pointer}
+  @media (max-width:900px){
+    .links,.signin{display:none}
+    .menu-btn{display:inline-flex;align-items:center}
+    .nav{padding-left:18px}
+    .header.open .links{
+      display:flex;flex-direction:column;align-items:stretch;gap:0;position:absolute;
+      top:calc(100% - 4px);left:16px;right:16px;padding:8px 20px 16px;
+      background:#0e0f11;border:1px solid rgba(255,255,255,.1);border-radius:20px;
+    }
+    .header.open .links a{display:block;padding:14px 0;border-bottom:1px solid rgba(255,255,255,.08)}
+    .links a.active::after{display:none}
+  }
+</style>
+</head>
+<body>
+
+<header class="header" id="header">
+  <div class="nav">
+    <a class="brand" href="#">
+      <svg viewBox="0 0 22 30" fill="#fff" aria-hidden="true"><path d="M11 0l3 8-3 20-3-20z"/><circle cx="11" cy="28" r="2"/></svg>
+      Plumb
+    </a>
+
+    <ul class="links">
+      <li><a href="#">How it works</a></li>
+      <li><a href="#">Features</a></li>
+      <li><a href="#" class="active">Customers</a></li>
+      <li><a href="#">Pricing</a></li>
+    </ul>
+
+    <div class="cta-wrap">
+      <a class="signin" href="#">Sign in</a>
+      <a class="cta" href="#">
+        Start writing
+        <span class="cta-arrow" aria-hidden="true">
+          <svg width="14" height="14" viewBox="0 0 14 14"><path d="M2 7h10M8 3l4 4-4 4" fill="none" stroke="#fff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+      </a>
+      <button class="menu-btn" type="button" onclick="document.getElementById('header').classList.toggle('open')">Menu</button>
+    </div>
+  </div>
+</header>
+
+</body>
+</html>
