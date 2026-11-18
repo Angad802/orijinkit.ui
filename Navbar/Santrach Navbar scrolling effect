@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Scroll Progress Navbar</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg: #f0f0f0;
+      --fg: #111111;
+      --nav-height: 44px;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+    }
+
+    /* ================= NAVBAR ================= */
+    .header {
+      position: fixed;
+      top: 0; left: 0;
+      width: 100%;
+      z-index: 100;
+      color: #fff;
+      mix-blend-mode: difference; /* auto invert on light/dark sections */
+      pointer-events: none;
+    }
+
+    .nav {
+      display: grid;
+      grid-template-columns: 1fr repeat(6, 1fr);
+      padding: 0 16px;
+      height: var(--nav-height);
+    }
+
+    .nav-link {
+      position: relative;
+      display: flex;
+      align-items: center;
+      height: 100%;
+      color: inherit;
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 500;
+      letter-spacing: -0.01em;
+      pointer-events: auto;
+    }
+
+    /* small tick at start of each item */
+    .nav-link::before {
+      content: "";
+      position: absolute;
+      left: 0; bottom: 0;
+      width: 1px; height: 6px;
+      background: currentColor;
+    }
+    .nav-logo::before { display: none; }
+
+    /* faint base line */
+    .nav-link::after {
+      content: "";
+      position: absolute;
+      left: 0; right: 0; bottom: 0;
+      height: 1px;
+      background: currentColor;
+      opacity: 0.2;
+    }
+
+    /* line that fills on scroll */
+    .progress {
+      position: absolute;
+      left: 0; bottom: 0;
+      width: 100%; height: 1px;
+      background: currentColor;
+      transform: scaleX(0);
+      transform-origin: left center;
+      will-change: transform;
+    }
+
+    /* hover: text slide up */
+    .label {
+      position: relative;
+      display: block;
+      overflow: hidden;
+      line-height: 1.2;
+      height: 1.2em;
+    }
+    .label span {
+      display: block;
+      transition: transform 0.45s cubic-bezier(0.7, 0, 0.2, 1);
+    }
+    .nav-link:hover .label span { transform: translateY(-100%); }
+
+    /* ================= SECTIONS ================= */
+    .section {
+      min-height: 150vh;
+      padding: 120px 16px 80px;
+      border-top: 1px solid rgba(0,0,0,0.1);
+    }
+    .section h2 {
+      font-size: clamp(48px, 10vw, 140px);
+      font-weight: 700;
+      letter-spacing: -0.04em;
+      line-height: 0.9;
+      margin-bottom: 24px;
+    }
+    .section.dark { background: var(--fg); color: var(--bg); }
+
+    .hero {
+      min-height: 100vh;
+      display: flex;
+      align-items: flex-end;
+      padding-bottom: 40px;
+    }
+    .hero-title {
+      font-size: 24vw;
+      font-weight: 800;
+      letter-spacing: -0.05em;
+      line-height: 0.8;
+    }
+
+    /* ================= MOBILE ================= */
+    @media (max-width: 768px) {
+      .nav { grid-template-columns: 30px repeat(6, 1fr); gap: 6px; }
+      .nav-link { font-size: 10px; }
+    }
+    @media (max-width: 480px) {
+      .label { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ===== NAVBAR ===== -->
+  <header class="header">
+    <nav class="nav">
+      <a href="#hero" class="nav-link nav-logo" data-section="hero" aria-label="Home">
+        <svg width="15" height="15" viewBox="0 0 15 15" fill="currentColor">
+          <path d="M10 5H15V10H10V15H5V10H0V5H5V0H10V5Z" />
+        </svg>
+        <span class="progress"></span>
+      </a>
+      <a href="#philosophy" class="nav-link" data-section="philosophy">
+        <span class="label"><span>Philosophy</span><span>Philosophy</span></span>
+        <span class="progress"></span>
+      </a>
+      <a href="#works" class="nav-link" data-section="works">
+        <span class="label"><span>Works</span><span>Works</span></span>
+        <span class="progress"></span>
+      </a>
+      <a href="#services" class="nav-link" data-section="services">
+        <span class="label"><span>Services</span><span>Services</span></span>
+        <span class="progress"></span>
+      </a>
+      <a href="#process" class="nav-link" data-section="process">
+        <span class="label"><span>Process</span><span>Process</span></span>
+        <span class="progress"></span>
+      </a>
+      <a href="#company" class="nav-link" data-section="company">
+        <span class="label"><span>Company</span><span>Company</span></span>
+        <span class="progress"></span>
+      </a>
+      <a href="#contact" class="nav-link" data-section="contact">
+        <span class="label"><span>Contact</span><span>Contact</span></span>
+        <span class="progress"></span>
+      </a>
+    </nav>
+  </header>
+
+  <!-- ===== SECTIONS ===== -->
+  <main>
+    <section id="hero" class="section hero">
+      <h1 class="hero-title">STUDIO</h1>
+    </section>
+    <section id="philosophy" class="section dark">
+      <h2>Philosophy</h2><p>Your philosophy content goes here.</p>
+    </section>
+    <section id="works" class="section">
+      <h2>Works</h2><p>Your works content goes here.</p>
+    </section>
+    <section id="services" class="section dark">
+      <h2>Services</h2><p>Your services content goes here.</p>
+    </section>
+    <section id="process" class="section">
+      <h2>Process</h2><p>Your process content goes here.</p>
+    </section>
+    <section id="company" class="section dark">
+      <h2>Company</h2><p>Your company content goes here.</p>
+    </section>
+    <section id="contact" class="section">
+      <h2>Contact</h2><p>Your contact content goes here.</p>
+    </section>
+  </main>
+
+  <script>
+    const items = [...document.querySelectorAll(".nav-link[data-section]")]
+      .map(link => ({
+        bar: link.querySelector(".progress"),
+        section: document.getElementById(link.dataset.section)
+      }))
+      .filter(i => i.section);
+
+    function update() {
+      const scrollY = window.scrollY;
+      const maxScroll = document.documentElement.scrollHeight - window.innerHeight;
+
+      items.forEach(({ bar, section }) => {
+        const start = section.offsetTop;
+        const end = Math.min(start + section.offsetHeight, maxScroll);
+        let p = (scrollY - start) / Math.max(end - start, 1);
+        p = Math.min(Math.max(p, 0), 1);
+        bar.style.transform = `scaleX(${p})`;
+      });
+    }
+
+    let ticking = false;
+    window.addEventListener("scroll", () => {
+      if (!ticking) {
+        requestAnimationFrame(() => { update(); ticking = false; });
+        ticking = true;
+      }
+    }, { passive: true });
+    window.addEventListener("resize", update);
+    window.addEventListener("load", update);
+    update();
+  </script>
+</body>
+</html>
